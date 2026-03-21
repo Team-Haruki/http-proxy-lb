@@ -10,7 +10,7 @@ A high-availability HTTP relay proxy with upstream load balancing, health checki
 | **Best-selection mode** | Always routes to the upstream with the lowest latency + connection score |
 | **Priority mode** | Routes to the highest-priority online upstream and automatically falls back when it is offline |
 | **Passive health detection** | Any upstream that fails to connect or respond is immediately marked offline and excluded from routing |
-| **Active health checking** | Background task periodically probes offline upstreams via TCP connect; marks them online once they recover |
+| **Active health checking** | Background task probes offline upstreams using a captive-style HTTP probe (`generate_204`) through the proxy; marks them online on HTTP 204 |
 | **Automatic failover** | Failed requests are retried on a different upstream (up to `min(pool_size, 3)` retries) |
 | **HTTP/1.1 keep-alive** | Client connections are reused across requests |
 | **HTTPS tunneling** | `CONNECT` method is fully supported — traffic is tunneled through the upstream proxy |
