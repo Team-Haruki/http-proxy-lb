@@ -132,6 +132,21 @@ impl UpstreamEntry {
 }
 
 // ---------------------------------------------------------------------------
+// UpstreamStatus — snapshot for admin API
+// ---------------------------------------------------------------------------
+
+/// Status snapshot of an upstream for metrics/admin API.
+pub struct UpstreamStatus {
+    pub url: String,
+    pub online: bool,
+    pub active_conns: i64,
+    pub latency_ema_ms: u64,
+    pub consec_failures: u32,
+    pub weight: u32,
+    pub priority: u32,
+}
+
+// ---------------------------------------------------------------------------
 // UpstreamPool — thread-safe collection of upstream entries
 // ---------------------------------------------------------------------------
 
@@ -225,6 +240,23 @@ impl UpstreamPool {
             .collect()
     }
 
+    /// Get status of all upstreams for metrics/admin API.
+    pub fn all_status(&self) -> Vec<UpstreamStatus> {
+        self.entries
+            .lock()
+            .iter()
+            .map(|e| UpstreamStatus {
+                url: e.config.url.clone(),
+                online: e.is_online(),
+                active_conns: e.active_conns.load(Ordering::Relaxed),
+                latency_ema_ms: e.latency_ema_ms.load(Ordering::Relaxed),
+                consec_failures: e.consec_failures.load(Ordering::Relaxed),
+                weight: e.config.weight,
+                priority: e.config.priority,
+            })
+            .collect()
+    }
+
     // ---- hot reload --------------------------------------------------------
 
     /// Replace the upstream list from a new config while preserving state/stats
@@ -268,16 +300,19 @@ impl UpstreamPool {
 mod tests {
     use super::*;
     use crate::config::{
-        BalanceMode, Config, DomainPolicyConfig, HealthCheckConfig, UpstreamConfig,
+        BalanceMode, Config, DomainPolicyConfig, HealthCheckConfig, LimitsConfig, UpstreamConfig,
     };
 
     fn make_pool(urls: &[&str]) -> Arc<UpstreamPool> {
         let cfg = Config {
             listen: "127.0.0.1:8080".to_string(),
+            admin_listen: None,
             mode: BalanceMode::RoundRobin,
             reload_interval_secs: 0,
             health_check: HealthCheckConfig::default(),
             domain_policy: DomainPolicyConfig::default(),
+            limits: LimitsConfig::default(),
+            access_log: false,
             upstream: urls
                 .iter()
                 .map(|u| UpstreamConfig {
@@ -370,10 +405,13 @@ mod tests {
         // Reload with same upstreams
         let new_cfg = Config {
             listen: "127.0.0.1:8080".to_string(),
+            admin_listen: None,
             mode: BalanceMode::RoundRobin,
             reload_interval_secs: 0,
             health_check: HealthCheckConfig::default(),
             domain_policy: DomainPolicyConfig::default(),
+            limits: LimitsConfig::default(),
+            access_log: false,
             upstream: vec![
                 UpstreamConfig {
                     url: "http://a:1".to_string(),
@@ -422,10 +460,13 @@ mod tests {
     fn weighted_round_robin_respects_weights() {
         let cfg = Config {
             listen: "127.0.0.1:8080".to_string(),
+            admin_listen: None,
             mode: BalanceMode::RoundRobin,
             reload_interval_secs: 0,
             health_check: HealthCheckConfig::default(),
             domain_policy: DomainPolicyConfig::default(),
+            limits: LimitsConfig::default(),
+            access_log: false,
             upstream: vec![
                 UpstreamConfig {
                     url: "http://a:1".to_string(),
@@ -464,10 +505,13 @@ mod tests {
     fn priority_mode_prefers_lowest_priority_value() {
         let cfg = Config {
             listen: "127.0.0.1:8080".to_string(),
+            admin_listen: None,
             mode: BalanceMode::Priority,
             reload_interval_secs: 0,
             health_check: HealthCheckConfig::default(),
             domain_policy: DomainPolicyConfig::default(),
+            limits: LimitsConfig::default(),
+            access_log: false,
             upstream: vec![
                 UpstreamConfig {
                     url: "http://a:1".to_string(),
@@ -502,10 +546,13 @@ mod tests {
     fn priority_mode_falls_back_to_next_online_priority() {
         let cfg = Config {
             listen: "127.0.0.1:8080".to_string(),
+            admin_listen: None,
             mode: BalanceMode::Priority,
             reload_interval_secs: 0,
             health_check: HealthCheckConfig::default(),
             domain_policy: DomainPolicyConfig::default(),
+            limits: LimitsConfig::default(),
+            access_log: false,
             upstream: vec![
                 UpstreamConfig {
                     url: "http://a:1".to_string(),
@@ -536,10 +583,13 @@ mod tests {
     fn reload_updates_priority_for_existing_upstream() {
         let cfg = Config {
             listen: "127.0.0.1:8080".to_string(),
+            admin_listen: None,
             mode: BalanceMode::Priority,
             reload_interval_secs: 0,
             health_check: HealthCheckConfig::default(),
             domain_policy: DomainPolicyConfig::default(),
+            limits: LimitsConfig::default(),
+            access_log: false,
             upstream: vec![
                 UpstreamConfig {
                     url: "http://a:1".to_string(),
@@ -563,10 +613,13 @@ mod tests {
 
         let reloaded = Config {
             listen: "127.0.0.1:8080".to_string(),
+            admin_listen: None,
             mode: BalanceMode::Priority,
             reload_interval_secs: 0,
             health_check: HealthCheckConfig::default(),
             domain_policy: DomainPolicyConfig::default(),
+            limits: LimitsConfig::default(),
+            access_log: false,
             upstream: vec![
                 UpstreamConfig {
                     url: "http://a:1".to_string(),

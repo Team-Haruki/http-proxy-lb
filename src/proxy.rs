@@ -13,8 +13,9 @@ use anyhow::{anyhow, bail, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
+use crate::admin::Metrics;
 use crate::config::{BalanceMode, DomainPolicyConfig, DomainPolicyMode};
 use crate::upstream::UpstreamPool;
 
@@ -38,6 +39,8 @@ pub async fn handle_client(
     pool: Arc<UpstreamPool>,
     mode: BalanceMode,
     domain_policy: Arc<DomainPolicyConfig>,
+    metrics: &Metrics,
+    access_log: bool,
 ) {
     let peer = client
         .peer_addr()
@@ -48,10 +51,13 @@ pub async fn handle_client(
     loop {
         match read_headers(&mut client).await {
             Ok(Some(buf)) => {
-                match dispatch(&mut client, &buf, &pool, mode, &domain_policy).await {
+                metrics.inc_requests_total();
+                let start = Instant::now();
+                match dispatch(&mut client, &buf, &pool, mode, &domain_policy, metrics, access_log, &peer, start).await {
                     Ok(true) => continue, // keep-alive: read next request
                     Ok(false) => break,
                     Err(e) => {
+                        metrics.inc_requests_failed();
                         debug!(peer = %peer, error = %e, "request dispatch error");
                         break;
                     }
@@ -73,12 +79,17 @@ pub async fn handle_client(
 // ---------------------------------------------------------------------------
 
 /// Returns `Ok(true)` if the client connection should be kept alive.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     client: &mut TcpStream,
     buf: &[u8],
     pool: &Arc<UpstreamPool>,
     mode: BalanceMode,
     domain_policy: &Arc<DomainPolicyConfig>,
+    metrics: &Metrics,
+    access_log: bool,
+    peer: &str,
+    start: Instant,
 ) -> Result<bool> {
     // --- parse request line + headers ---
     let mut raw_headers = [httparse::EMPTY_HEADER; 96];
@@ -108,17 +119,42 @@ async fn dispatch(
 
     // --- CONNECT (HTTPS tunnel) ---
     if method.eq_ignore_ascii_case("CONNECT") {
+        metrics.inc_connect();
         let (host, port) = parse_connect_target(&path)?;
         let use_proxy = should_use_proxy(&host, domain_policy);
-        return handle_connect(client, &host, port, pool, mode, use_proxy)
-            .await
-            .map(|_| false);
+        if !use_proxy {
+            metrics.inc_direct();
+        }
+        let result = handle_connect(client, &host, port, pool, mode, use_proxy).await;
+        let elapsed_ms = start.elapsed().as_millis();
+        let status = if result.is_ok() { 200 } else { 502 };
+        if result.is_ok() {
+            metrics.inc_requests_success();
+        } else {
+            metrics.inc_requests_failed();
+        }
+        if access_log {
+            info!(
+                peer = %peer,
+                method = "CONNECT",
+                target = %path,
+                status = status,
+                elapsed_ms = elapsed_ms,
+                direct = !use_proxy,
+                "access"
+            );
+        }
+        return result.map(|_| false);
     }
 
     // --- Plain HTTP ---
+    metrics.inc_http();
     let (target_host, target_port) = parse_http_target(&path, headers)?;
     let use_proxy = should_use_proxy(&target_host, domain_policy);
-    handle_http(
+    if !use_proxy {
+        metrics.inc_direct();
+    }
+    let result = handle_http(
         client,
         &method,
         &path,
@@ -132,7 +168,26 @@ async fn dispatch(
         use_proxy,
         (&target_host, target_port),
     )
-    .await
+    .await;
+    let elapsed_ms = start.elapsed().as_millis();
+    let status = if result.is_ok() { 200 } else { 502 };
+    if result.is_ok() {
+        metrics.inc_requests_success();
+    } else {
+        metrics.inc_requests_failed();
+    }
+    if access_log {
+        info!(
+            peer = %peer,
+            method = %method,
+            target = %path,
+            status = status,
+            elapsed_ms = elapsed_ms,
+            direct = !use_proxy,
+            "access"
+        );
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::{debug, info};
 
+use crate::admin::Metrics;
 use crate::upstream::UpstreamPool;
 
 const CAPTIVE_PROBE_URL: &str = "http://connectivitycheck.gstatic.com/generate_204";
@@ -19,17 +20,22 @@ const PROBE_RESPONSE_BUFFER_SIZE: usize = 256;
 /// sends a captive-style HTTP probe request through the upstream proxy with
 /// `timeout_secs` deadline, and marks the upstream **online** if it returns
 /// HTTP 204.
-pub async fn run_health_checker(pool: Arc<UpstreamPool>, interval_secs: u64, timeout_secs: u64) {
+pub async fn run_health_checker(
+    pool: Arc<UpstreamPool>,
+    metrics: Arc<Metrics>,
+    interval_secs: u64,
+    timeout_secs: u64,
+) {
     let interval = Duration::from_secs(interval_secs);
     let probe_timeout = Duration::from_secs(timeout_secs);
 
     loop {
         tokio::time::sleep(interval).await;
-        probe_offline(&pool, probe_timeout).await;
+        probe_offline(&pool, &metrics, probe_timeout).await;
     }
 }
 
-async fn probe_offline(pool: &Arc<UpstreamPool>, probe_timeout: Duration) {
+async fn probe_offline(pool: &Arc<UpstreamPool>, metrics: &Arc<Metrics>, probe_timeout: Duration) {
     let offline = pool.offline_entries();
     if offline.is_empty() {
         return;
@@ -44,7 +50,9 @@ async fn probe_offline(pool: &Arc<UpstreamPool>, probe_timeout: Duration) {
         .into_iter()
         .map(|entry| {
             let t = probe_timeout;
+            let metrics = Arc::clone(metrics);
             tokio::spawn(async move {
+                metrics.inc_health_check();
                 let addr = match entry.host_port() {
                     Ok((h, p)) => format!("{h}:{p}"),
                     Err(e) => {
@@ -56,6 +64,7 @@ async fn probe_offline(pool: &Arc<UpstreamPool>, probe_timeout: Duration) {
                     Ok(true) => {
                         info!(upstream = %entry.config.url, "health check OK (HTTP 204) — marking online");
                         entry.mark_online();
+                        metrics.inc_health_check_success();
                     }
                     Ok(false) => {
                         debug!(upstream = %entry.config.url, "health check got non-204 response");
@@ -120,7 +129,7 @@ async fn probe_proxy_by_captive_http(
 mod tests {
     use super::*;
     use crate::config::{
-        BalanceMode, Config, DomainPolicyConfig, HealthCheckConfig, UpstreamConfig,
+        BalanceMode, Config, DomainPolicyConfig, HealthCheckConfig, LimitsConfig, UpstreamConfig,
     };
     use crate::upstream::UpstreamPool;
     use tokio::net::TcpListener;
@@ -142,10 +151,13 @@ mod tests {
 
         let cfg = Config {
             listen: "127.0.0.1:8080".to_string(),
+            admin_listen: None,
             mode: BalanceMode::RoundRobin,
             reload_interval_secs: 0,
             health_check: HealthCheckConfig::default(),
             domain_policy: DomainPolicyConfig::default(),
+            limits: LimitsConfig::default(),
+            access_log: false,
             upstream: vec![UpstreamConfig {
                 url: format!("http://127.0.0.1:{port}"),
                 weight: 1,
@@ -155,11 +167,12 @@ mod tests {
             }],
         };
         let pool = UpstreamPool::from_config(&cfg);
+        let metrics = Metrics::new();
         let (_, entry) = pool.select(BalanceMode::RoundRobin, &[]).unwrap();
         entry.mark_offline();
         assert!(!entry.is_online());
 
-        probe_offline(&pool, Duration::from_secs(2)).await;
+        probe_offline(&pool, &metrics, Duration::from_secs(2)).await;
         assert!(entry.is_online());
     }
 
@@ -179,10 +192,13 @@ mod tests {
 
         let cfg = Config {
             listen: "127.0.0.1:8080".to_string(),
+            admin_listen: None,
             mode: BalanceMode::RoundRobin,
             reload_interval_secs: 0,
             health_check: HealthCheckConfig::default(),
             domain_policy: DomainPolicyConfig::default(),
+            limits: LimitsConfig::default(),
+            access_log: false,
             upstream: vec![UpstreamConfig {
                 url: format!("http://127.0.0.1:{port}"),
                 weight: 1,
@@ -192,11 +208,12 @@ mod tests {
             }],
         };
         let pool = UpstreamPool::from_config(&cfg);
+        let metrics = Metrics::new();
         let (_, entry) = pool.select(BalanceMode::RoundRobin, &[]).unwrap();
         entry.mark_offline();
         assert!(!entry.is_online());
 
-        probe_offline(&pool, Duration::from_secs(2)).await;
+        probe_offline(&pool, &metrics, Duration::from_secs(2)).await;
         assert!(!entry.is_online());
     }
 }

@@ -13,6 +13,11 @@ pub struct Config {
     /// Local listen address, e.g. "127.0.0.1:8080"
     pub listen: String,
 
+    /// Optional admin/metrics listen address, e.g. "127.0.0.1:9090"
+    /// Exposes /metrics (Prometheus) and /status (JSON) endpoints.
+    #[serde(default)]
+    pub admin_listen: Option<String>,
+
     /// Load-balancing mode
     #[serde(default)]
     pub mode: BalanceMode,
@@ -28,6 +33,14 @@ pub struct Config {
     /// Domain-based direct/proxy routing policy
     #[serde(default)]
     pub domain_policy: DomainPolicyConfig,
+
+    /// Resource limits and timeouts
+    #[serde(default)]
+    pub limits: LimitsConfig,
+
+    /// Enable access logging (default: false)
+    #[serde(default)]
+    pub access_log: bool,
 
     /// Upstream proxy list
     #[serde(default)]
@@ -115,6 +128,39 @@ fn default_hc_interval() -> u64 {
 }
 fn default_hc_timeout() -> u64 {
     5
+}
+
+// ---------------------------------------------------------------------------
+// Limits config
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LimitsConfig {
+    /// Maximum concurrent client connections (0 = unlimited)
+    #[serde(default)]
+    pub max_connections: usize,
+
+    /// Request timeout in seconds (0 = unlimited)
+    #[serde(default)]
+    pub request_timeout_secs: u64,
+
+    /// Graceful shutdown timeout in seconds
+    #[serde(default = "default_shutdown_timeout")]
+    pub shutdown_timeout_secs: u64,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 0,
+            request_timeout_secs: 0,
+            shutdown_timeout_secs: default_shutdown_timeout(),
+        }
+    }
+}
+
+fn default_shutdown_timeout() -> u64 {
+    30
 }
 
 // ---------------------------------------------------------------------------
@@ -309,5 +355,39 @@ upstream: []
         assert_eq!(cfg.domain_policy.mode, DomainPolicyMode::Blacklist);
         assert_eq!(cfg.domain_policy.domains.len(), 2);
         assert_eq!(cfg.domain_policy.domains[0], "example.com");
+    }
+
+    #[test]
+    fn test_parse_yaml_limits() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+admin_listen: "127.0.0.1:9090"
+access_log: true
+limits:
+  max_connections: 1000
+  request_timeout_secs: 60
+  shutdown_timeout_secs: 15
+upstream: []
+"#;
+        let cfg: Config = yaml_serde::from_str(yaml).unwrap();
+        assert_eq!(cfg.admin_listen, Some("127.0.0.1:9090".to_string()));
+        assert!(cfg.access_log);
+        assert_eq!(cfg.limits.max_connections, 1000);
+        assert_eq!(cfg.limits.request_timeout_secs, 60);
+        assert_eq!(cfg.limits.shutdown_timeout_secs, 15);
+    }
+
+    #[test]
+    fn test_parse_yaml_limits_defaults() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+upstream: []
+"#;
+        let cfg: Config = yaml_serde::from_str(yaml).unwrap();
+        assert!(cfg.admin_listen.is_none());
+        assert!(!cfg.access_log);
+        assert_eq!(cfg.limits.max_connections, 0);
+        assert_eq!(cfg.limits.request_timeout_secs, 0);
+        assert_eq!(cfg.limits.shutdown_timeout_secs, 30);
     }
 }
