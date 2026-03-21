@@ -27,6 +27,12 @@ health_check:
 #   whitelist — listed domains use upstream proxy; others go direct
 domain_policy:
   mode: off
+  # expression examples:
+  # - "domain:example.com"   # exact
+  # - "suffix:example.com"   # suffix
+  # - "*.example.com"        # suffix shorthand
+  # - ".example.com"         # suffix shorthand
+  # - "example.com"          # backward-compatible exact-or-suffix
   domains: []
 
 # Upstream proxy pool

@@ -717,9 +717,50 @@ fn should_use_proxy(host: &str, policy: &DomainPolicyConfig) -> bool {
     }
 }
 
-fn domain_matches(host_lc: &str, domain: &str) -> bool {
-    let d = domain.trim().to_ascii_lowercase();
-    host_lc == d || host_lc.ends_with(&format!(".{d}"))
+fn domain_matches(host_lc: &str, domain_expr: &str) -> bool {
+    let expr = domain_expr.trim().to_ascii_lowercase();
+    if expr.is_empty() {
+        return false;
+    }
+
+    if let Some(domain) = expr.strip_prefix("domain:") {
+        if domain.is_empty() {
+            return false;
+        }
+        return host_lc == domain;
+    }
+    if let Some(suffix) = expr.strip_prefix("suffix:") {
+        if suffix.is_empty() {
+            return false;
+        }
+        return host_matches_suffix(host_lc, suffix);
+    }
+    if let Some(suffix) = expr.strip_prefix("*.") {
+        if suffix.is_empty() {
+            return false;
+        }
+        return host_matches_suffix(host_lc, suffix);
+    }
+    if let Some(suffix) = expr.strip_prefix('.') {
+        if suffix.is_empty() {
+            return false;
+        }
+        return host_matches_suffix(host_lc, suffix);
+    }
+
+    // Backward-compatible default behavior for plain values:
+    // exact domain OR subdomain suffix.
+    host_lc == expr || host_matches_suffix(host_lc, &expr)
+}
+
+fn host_matches_suffix(host_lc: &str, suffix: &str) -> bool {
+    if suffix.is_empty() {
+        return false;
+    }
+    host_lc == suffix
+        || host_lc
+            .strip_suffix(suffix)
+            .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 fn parse_http_target(path: &str, headers: &[httparse::Header<'_>]) -> Result<(String, u16)> {
@@ -851,5 +892,26 @@ mod tests {
             ),
             "GET /a/b?q=1 HTTP/1.1"
         );
+    }
+
+    #[test]
+    fn domain_expression_supports_exact_and_suffix_variants() {
+        assert!(domain_matches("api.example.com", "suffix:example.com"));
+        assert!(domain_matches("api.example.com", "*.example.com"));
+        assert!(domain_matches("api.example.com", ".example.com"));
+        assert!(domain_matches("example.com", "domain:example.com"));
+        assert!(!domain_matches("api.example.com", "domain:example.com"));
+        assert!(domain_matches("example.com", "example.com"));
+        assert!(domain_matches("api.example.com", "example.com"));
+        assert!(!domain_matches("example.com", ""));
+        assert!(!domain_matches("example.com", "domain:"));
+        assert!(!domain_matches("example.com", "suffix:"));
+        assert!(!domain_matches("example.com", "*."));
+        assert!(!domain_matches("example.com", "."));
+    }
+
+    #[test]
+    fn empty_suffix_does_not_match() {
+        assert!(!host_matches_suffix("example.com", ""));
     }
 }

@@ -55,7 +55,7 @@ health_check:
 
 domain_policy:
   mode: off           # off | blacklist | whitelist
-  domains: []         # blacklist: direct; whitelist: proxy
+  domains: []         # supports domain:, suffix:, *., . shorthand
 
 upstream:
   - url: "http://proxy1.example.com:8080"
@@ -88,6 +88,13 @@ Edit `config.yaml` while the proxy is running.  Within `reload_interval_secs` se
 * **`off`** (default): all domains use upstream proxy.
 * **`blacklist`**: domains listed in `domains` bypass upstream proxy and connect directly; other domains still use upstream proxy.
 * **`whitelist`**: only domains listed in `domains` use upstream proxy; other domains connect directly.
+
+Expression formats in `domains`:
+
+* `domain:example.com` — exact domain match
+* `suffix:example.com` — suffix match (`example.com` and `*.example.com`)
+* `*.example.com` / `.example.com` — suffix shorthand
+* `example.com` — backward-compatible exact-or-suffix match
 
 ## Usage with curl
 
