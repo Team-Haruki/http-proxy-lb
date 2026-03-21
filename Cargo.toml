@@ -1,0 +1,28 @@
+[package]
+name = "http-proxy-lb"
+version = "0.1.0"
+edition = "2021"
+description = "HTTP relay proxy with upstream load balancing, health checking, and hot reload"
+license = "MIT"
+
+[[bin]]
+name = "http-proxy-lb"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+# HTTP/1.x request/response parsing
+httparse = "1"
+# Serialization
+serde = { version = "1", features = ["derive"] }
+yaml_serde = "0.10"
+# CLI
+clap = { version = "4", features = ["derive"] }
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Utilities
+anyhow = "1"
+base64 = "0.22"
+parking_lot = "0.12"

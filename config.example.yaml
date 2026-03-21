@@ -1,0 +1,38 @@
+# http-proxy-lb example configuration
+# Copy to config.yaml and edit as needed.
+
+# Local address and port to listen on
+listen: "127.0.0.1:8080"
+
+# Load-balancing mode: round_robin | best
+#   round_robin — weighted round-robin across all online upstreams
+#   best        — select the online upstream with the lowest combined score
+#                 (latency EMA + active-connection penalty)
+mode: round_robin
+
+# Hot-reload: re-read config file every N seconds (0 = disabled)
+reload_interval_secs: 60
+
+# Active health-check settings
+health_check:
+  # How often to probe offline upstreams (seconds)
+  interval_secs: 30
+  # TCP-connect timeout when probing (seconds)
+  timeout_secs: 5
+
+# Upstream proxy pool
+# url      — http://host:port  (only HTTP proxies supported)
+# weight   — relative weight for round_robin (default: 1)
+# username — optional HTTP proxy Basic-Auth username
+# password — optional HTTP proxy Basic-Auth password
+upstream:
+  - url: "http://proxy1.example.com:8080"
+    weight: 1
+
+  - url: "http://proxy2.example.com:8080"
+    weight: 2
+    username: "user"
+    password: "secret"
+
+  - url: "http://proxy3.example.com:3128"
+    weight: 1
