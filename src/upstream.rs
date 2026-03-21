@@ -213,16 +213,15 @@ impl UpstreamPool {
         let new_entries: Vec<Arc<UpstreamEntry>> = new_cfg
             .upstream
             .iter()
-            .map(|new_cfg| {
+            .map(|upstream_cfg| {
                 // Reuse existing entry if URL matches (preserves state/stats).
-                if let Some(existing) = entries.iter().find(|e| e.config.url == new_cfg.url) {
-                    // Update weight and auth in case they changed.
-                    // State and stats are preserved.
-                    debug!(url = %new_cfg.url, "reusing existing upstream entry");
+                if let Some(existing) = entries.iter().find(|e| e.config.url == upstream_cfg.url) {
+                    // State and stats are preserved; config reference is kept as-is.
+                    debug!(url = %upstream_cfg.url, "reusing existing upstream entry");
                     Arc::clone(existing)
                 } else {
-                    info!(url = %new_cfg.url, "adding new upstream");
-                    UpstreamEntry::new(new_cfg.clone())
+                    info!(url = %upstream_cfg.url, "adding new upstream");
+                    UpstreamEntry::new(upstream_cfg.clone())
                 }
             })
             .collect();

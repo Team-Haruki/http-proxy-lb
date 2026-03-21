@@ -112,8 +112,6 @@ async fn dispatch(
     handle_http(
         client,
         &method,
-        &path,
-        version,
         buf,
         body_offset,
         req_content_length,
@@ -237,8 +235,6 @@ async fn tunnel(client: &mut TcpStream, mut upstream: TcpStream) -> Result<()> {
 async fn handle_http(
     client: &mut TcpStream,
     method: &str,
-    _path: &str,
-    _version: u8,
     req_buf: &[u8],     // raw bytes: headers + any already-buffered body bytes
     body_offset: usize, // where headers end within req_buf
     req_content_length: Option<u64>,
