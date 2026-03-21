@@ -15,7 +15,7 @@ use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, warn};
 
-use crate::config::BalanceMode;
+use crate::config::{BalanceMode, DomainPolicyConfig, DomainPolicyMode};
 use crate::upstream::UpstreamPool;
 
 // ---------------------------------------------------------------------------
@@ -33,7 +33,12 @@ const MAX_RETRIES: usize = 3;
 
 /// Accept a single client TCP connection and serve HTTP proxy requests on it.
 /// Supports keep-alive: loops until the client closes or sends `Connection: close`.
-pub async fn handle_client(mut client: TcpStream, pool: Arc<UpstreamPool>, mode: BalanceMode) {
+pub async fn handle_client(
+    mut client: TcpStream,
+    pool: Arc<UpstreamPool>,
+    mode: BalanceMode,
+    domain_policy: Arc<DomainPolicyConfig>,
+) {
     let peer = client
         .peer_addr()
         .map(|a| a.to_string())
@@ -43,7 +48,7 @@ pub async fn handle_client(mut client: TcpStream, pool: Arc<UpstreamPool>, mode:
     loop {
         match read_headers(&mut client).await {
             Ok(Some(buf)) => {
-                match dispatch(&mut client, &buf, &pool, mode).await {
+                match dispatch(&mut client, &buf, &pool, mode, &domain_policy).await {
                     Ok(true) => continue, // keep-alive: read next request
                     Ok(false) => break,
                     Err(e) => {
@@ -73,6 +78,7 @@ async fn dispatch(
     buf: &[u8],
     pool: &Arc<UpstreamPool>,
     mode: BalanceMode,
+    domain_policy: &Arc<DomainPolicyConfig>,
 ) -> Result<bool> {
     // --- parse request line + headers ---
     let mut raw_headers = [httparse::EMPTY_HEADER; 96];
@@ -103,15 +109,19 @@ async fn dispatch(
     // --- CONNECT (HTTPS tunnel) ---
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = parse_connect_target(&path)?;
-        return handle_connect(client, &host, port, pool, mode)
+        let use_proxy = should_use_proxy(&host, domain_policy);
+        return handle_connect(client, &host, port, pool, mode, use_proxy)
             .await
             .map(|_| false);
     }
 
     // --- Plain HTTP ---
+    let (target_host, target_port) = parse_http_target(&path, headers)?;
+    let use_proxy = should_use_proxy(&target_host, domain_policy);
     handle_http(
         client,
         &method,
+        &path,
         buf,
         body_offset,
         req_content_length,
@@ -119,6 +129,8 @@ async fn dispatch(
         client_keep_alive,
         pool,
         mode,
+        use_proxy,
+        (&target_host, target_port),
     )
     .await
 }
@@ -133,7 +145,17 @@ async fn handle_connect(
     port: u16,
     pool: &Arc<UpstreamPool>,
     mode: BalanceMode,
+    use_proxy: bool,
 ) -> Result<()> {
+    if !use_proxy {
+        let addr = format!("{host}:{port}");
+        let up_stream = connect_target(&addr).await?;
+        client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
+        return tunnel(client, up_stream).await;
+    }
+
     let mut tried: Vec<usize> = Vec::new();
     let max_retries = pool.len().min(MAX_RETRIES);
 
@@ -235,6 +257,7 @@ async fn tunnel(client: &mut TcpStream, mut upstream: TcpStream) -> Result<()> {
 async fn handle_http(
     client: &mut TcpStream,
     method: &str,
+    path: &str,
     req_buf: &[u8],     // raw bytes: headers + any already-buffered body bytes
     body_offset: usize, // where headers end within req_buf
     req_content_length: Option<u64>,
@@ -242,7 +265,48 @@ async fn handle_http(
     client_keep_alive: bool,
     pool: &Arc<UpstreamPool>,
     mode: BalanceMode,
+    use_proxy: bool,
+    direct_target: (&str, u16),
 ) -> Result<bool> {
+    if !use_proxy {
+        let addr = format!("{}:{}", direct_target.0, direct_target.1);
+        let mut direct_stream = match connect_target(&addr).await {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = write_status(client, 502, "Bad Gateway").await;
+                return Ok(false);
+            }
+        };
+        let no_proxy_auth = None;
+        let direct_original_path = Some(path);
+        let fwd_headers =
+            rewrite_request_headers(req_buf, body_offset, no_proxy_auth, direct_original_path);
+        direct_stream.write_all(&fwd_headers).await?;
+
+        let already_in_buf = req_buf.len().saturating_sub(body_offset);
+        if already_in_buf > 0 {
+            direct_stream.write_all(&req_buf[body_offset..]).await?;
+        }
+        if forward_body(
+            client,
+            &mut direct_stream,
+            req_content_length,
+            req_is_chunked,
+            already_in_buf as u64,
+        )
+        .await
+        .is_err()
+        {
+            return Ok(false);
+        }
+
+        let upstream_keep_alive = match forward_response(&mut direct_stream, client, method).await {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
+        };
+        return Ok(client_keep_alive && upstream_keep_alive);
+    }
+
     let mut tried: Vec<usize> = Vec::new();
     let max_retries = pool.len().min(MAX_RETRIES);
 
@@ -275,8 +339,12 @@ async fn handle_http(
         };
 
         // --- Build and send request headers ---
-        let fwd_headers =
-            rewrite_request_headers(req_buf, body_offset, upstream.config.proxy_auth_header());
+        let fwd_headers = rewrite_request_headers(
+            req_buf,
+            body_offset,
+            upstream.config.proxy_auth_header(),
+            None,
+        );
         if let Err(e) = up_stream.write_all(&fwd_headers).await {
             warn!(upstream = %upstream.config.url, error = %e, "HTTP: write headers failed");
             upstream.mark_offline();
@@ -527,16 +595,26 @@ async fn read_headers(stream: &mut TcpStream) -> Result<Option<Vec<u8>>> {
 /// * Removes `Proxy-Authorization` from the client to avoid leaking
 ///   the client's upstream credentials to the next hop.
 /// * Injects our upstream's `Proxy-Authorization` if required.
-fn rewrite_request_headers(raw: &[u8], body_offset: usize, proxy_auth: Option<String>) -> Vec<u8> {
+fn rewrite_request_headers(
+    raw: &[u8],
+    body_offset: usize,
+    proxy_auth: Option<String>,
+    original_path: Option<&str>,
+) -> Vec<u8> {
     let header_bytes = &raw[..body_offset];
     let header_str = String::from_utf8_lossy(header_bytes);
 
     let mut out = String::with_capacity(header_bytes.len() + 64);
     let mut first_line = true;
 
+    let is_direct_mode = original_path.is_some();
     for line in header_str.split("\r\n") {
         if first_line {
-            out.push_str(line);
+            if let Some(path) = original_path {
+                out.push_str(&rewrite_request_line_for_direct(line, path));
+            } else {
+                out.push_str(line);
+            }
             out.push_str("\r\n");
             first_line = false;
             continue;
@@ -554,6 +632,9 @@ fn rewrite_request_headers(raw: &[u8], body_offset: usize, proxy_auth: Option<St
             .to_ascii_lowercase()
             .starts_with("proxy-authorization:")
         {
+            continue;
+        }
+        if is_direct_mode && line.to_ascii_lowercase().starts_with("proxy-connection:") {
             continue;
         }
         out.push_str(line);
@@ -595,6 +676,10 @@ async fn read_connect_response(upstream: &mut TcpStream) -> Result<u32> {
 // ---------------------------------------------------------------------------
 
 async fn connect_upstream(addr: &str) -> Result<TcpStream> {
+    connect_target(addr).await
+}
+
+async fn connect_target(addr: &str) -> Result<TcpStream> {
     timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
         .await
         .map_err(|_| anyhow!("connection to {addr} timed out"))?
@@ -622,6 +707,95 @@ fn get_header<'a>(headers: &'a [httparse::Header<'a>], name: &str) -> Option<&'a
     })
 }
 
+fn should_use_proxy(host: &str, policy: &DomainPolicyConfig) -> bool {
+    let host_lc = host.to_ascii_lowercase();
+    let matched = policy.domains.iter().any(|d| domain_matches(&host_lc, d));
+    match policy.mode {
+        DomainPolicyMode::Off => true,
+        DomainPolicyMode::Blacklist => !matched,
+        DomainPolicyMode::Whitelist => matched,
+    }
+}
+
+fn domain_matches(host_lc: &str, domain: &str) -> bool {
+    let d = domain.trim().to_ascii_lowercase();
+    host_lc == d || host_lc.ends_with(&format!(".{d}"))
+}
+
+fn parse_http_target(path: &str, headers: &[httparse::Header<'_>]) -> Result<(String, u16)> {
+    if let Some(rest) = path
+        .strip_prefix("http://")
+        .or_else(|| path.strip_prefix("https://"))
+    {
+        let authority = rest.split('/').next().unwrap_or(rest);
+        return parse_authority_host_port(authority, 80);
+    }
+    let host = get_header(headers, "host").ok_or_else(|| anyhow!("missing Host header"))?;
+    parse_authority_host_port(host, 80)
+}
+
+fn parse_authority_host_port(authority: &str, default_port: u16) -> Result<(String, u16)> {
+    let authority = authority.trim();
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+
+    if let Some(rest) = authority.strip_prefix('[') {
+        let end = rest
+            .find(']')
+            .ok_or_else(|| anyhow!("invalid bracketed authority: {authority}"))?;
+        let host = &rest[..end];
+        if host.is_empty() {
+            bail!("invalid authority: {authority}");
+        }
+
+        let port = match &rest[end + 1..] {
+            "" => default_port,
+            suffix if suffix.starts_with(':') => suffix[1..].parse::<u16>().unwrap_or(default_port),
+            _ => bail!("invalid bracketed authority: {authority}"),
+        };
+        return Ok((host.to_string(), port));
+    }
+
+    let colon_count = authority.matches(':').count();
+    if colon_count > 1 {
+        // Unbracketed IPv6 literal; treat entire authority as host with default port.
+        return Ok((authority.to_string(), default_port));
+    }
+
+    let mut parts = authority.splitn(2, ':');
+    let host = parts
+        .next()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| anyhow!("invalid authority: {authority}"))?
+        .to_string();
+    let port = match parts.next() {
+        Some("") | None => default_port,
+        Some(p) => p
+            .parse::<u16>()
+            .map_err(|_| anyhow!("invalid port in authority: {authority}"))?,
+    };
+    Ok((host, port))
+}
+
+fn rewrite_request_line_for_direct(line: &str, original_path: &str) -> String {
+    let mut p = line.split_whitespace();
+    let method = p.next().unwrap_or("GET");
+    let fallback_target = p.next().unwrap_or(original_path);
+    let version = p.next().unwrap_or("HTTP/1.1");
+    let target = absolute_to_origin_form(original_path).unwrap_or(fallback_target);
+    format!("{method} {target} {version}")
+}
+
+fn absolute_to_origin_form(path: &str) -> Option<&str> {
+    let rest = path
+        .strip_prefix("http://")
+        .or_else(|| path.strip_prefix("https://"))?;
+    let slash = rest.find('/').unwrap_or(rest.len());
+    if slash == rest.len() {
+        return Some("/");
+    }
+    Some(&rest[slash..])
+}
+
 fn client_wants_keep_alive(headers: &[httparse::Header<'_>], version: u8) -> bool {
     match get_header(headers, "connection").map(|v| v.to_ascii_lowercase()) {
         Some(ref v) if v.contains("close") => false,
@@ -642,4 +816,40 @@ async fn write_status(stream: &mut TcpStream, code: u16, msg: &str) -> Result<()
     let resp = format!("HTTP/1.1 {code} {msg}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     stream.write_all(resp.as_bytes()).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whitelist_only_uses_proxy_for_listed_domains() {
+        let p = DomainPolicyConfig {
+            mode: DomainPolicyMode::Whitelist,
+            domains: vec!["example.com".to_string()],
+        };
+        assert!(should_use_proxy("api.example.com", &p));
+        assert!(!should_use_proxy("google.com", &p));
+    }
+
+    #[test]
+    fn blacklist_skips_proxy_for_listed_domains() {
+        let p = DomainPolicyConfig {
+            mode: DomainPolicyMode::Blacklist,
+            domains: vec!["example.com".to_string()],
+        };
+        assert!(!should_use_proxy("example.com", &p));
+        assert!(should_use_proxy("google.com", &p));
+    }
+
+    #[test]
+    fn absolute_uri_is_rewritten_to_origin_form() {
+        assert_eq!(
+            rewrite_request_line_for_direct(
+                "GET http://example.com/a/b?q=1 HTTP/1.1",
+                "http://example.com/a/b?q=1"
+            ),
+            "GET /a/b?q=1 HTTP/1.1"
+        );
+    }
 }

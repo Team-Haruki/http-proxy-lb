@@ -119,7 +119,9 @@ async fn probe_proxy_by_captive_http(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BalanceMode, Config, HealthCheckConfig, UpstreamConfig};
+    use crate::config::{
+        BalanceMode, Config, DomainPolicyConfig, HealthCheckConfig, UpstreamConfig,
+    };
     use crate::upstream::UpstreamPool;
     use tokio::net::TcpListener;
 
@@ -143,6 +145,7 @@ mod tests {
             mode: BalanceMode::RoundRobin,
             reload_interval_secs: 0,
             health_check: HealthCheckConfig::default(),
+            domain_policy: DomainPolicyConfig::default(),
             upstream: vec![UpstreamConfig {
                 url: format!("http://127.0.0.1:{port}"),
                 weight: 1,
@@ -179,6 +182,7 @@ mod tests {
             mode: BalanceMode::RoundRobin,
             reload_interval_secs: 0,
             health_check: HealthCheckConfig::default(),
+            domain_policy: DomainPolicyConfig::default(),
             upstream: vec![UpstreamConfig {
                 url: format!("http://127.0.0.1:{port}"),
                 weight: 1,

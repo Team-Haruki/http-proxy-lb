@@ -25,6 +25,10 @@ pub struct Config {
     #[serde(default)]
     pub health_check: HealthCheckConfig,
 
+    /// Domain-based direct/proxy routing policy
+    #[serde(default)]
+    pub domain_policy: DomainPolicyConfig,
+
     /// Upstream proxy list
     #[serde(default)]
     pub upstream: Vec<UpstreamConfig>,
@@ -48,6 +52,39 @@ pub enum BalanceMode {
     Best,
     /// Pick the online upstream with the highest priority (lowest number)
     Priority,
+}
+
+// ---------------------------------------------------------------------------
+// Domain policy config
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainPolicyMode {
+    /// Always use upstream proxy (default)
+    #[default]
+    Off,
+    /// Listed domains go direct, others use upstream proxy
+    Blacklist,
+    /// Listed domains use upstream proxy, others go direct
+    Whitelist,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainPolicyConfig {
+    #[serde(default)]
+    pub mode: DomainPolicyMode,
+    #[serde(default)]
+    pub domains: Vec<String>,
+}
+
+impl Default for DomainPolicyConfig {
+    fn default() -> Self {
+        Self {
+            mode: DomainPolicyMode::Off,
+            domains: Vec::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -253,5 +290,24 @@ upstream: []
         assert_eq!(cfg.reload_interval_secs, 60);
         assert_eq!(cfg.health_check.interval_secs, 30);
         assert_eq!(cfg.health_check.timeout_secs, 5);
+        assert_eq!(cfg.domain_policy.mode, DomainPolicyMode::Off);
+        assert!(cfg.domain_policy.domains.is_empty());
+    }
+
+    #[test]
+    fn test_parse_yaml_domain_policy() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+domain_policy:
+  mode: blacklist
+  domains:
+    - "example.com"
+    - "internal.local"
+upstream: []
+"#;
+        let cfg: Config = yaml_serde::from_str(yaml).unwrap();
+        assert_eq!(cfg.domain_policy.mode, DomainPolicyMode::Blacklist);
+        assert_eq!(cfg.domain_policy.domains.len(), 2);
+        assert_eq!(cfg.domain_policy.domains[0], "example.com");
     }
 }

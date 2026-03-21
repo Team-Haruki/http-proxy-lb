@@ -267,7 +267,9 @@ impl UpstreamPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BalanceMode, Config, HealthCheckConfig, UpstreamConfig};
+    use crate::config::{
+        BalanceMode, Config, DomainPolicyConfig, HealthCheckConfig, UpstreamConfig,
+    };
 
     fn make_pool(urls: &[&str]) -> Arc<UpstreamPool> {
         let cfg = Config {
@@ -275,6 +277,7 @@ mod tests {
             mode: BalanceMode::RoundRobin,
             reload_interval_secs: 0,
             health_check: HealthCheckConfig::default(),
+            domain_policy: DomainPolicyConfig::default(),
             upstream: urls
                 .iter()
                 .map(|u| UpstreamConfig {
@@ -370,6 +373,7 @@ mod tests {
             mode: BalanceMode::RoundRobin,
             reload_interval_secs: 0,
             health_check: HealthCheckConfig::default(),
+            domain_policy: DomainPolicyConfig::default(),
             upstream: vec![
                 UpstreamConfig {
                     url: "http://a:1".to_string(),
@@ -421,6 +425,7 @@ mod tests {
             mode: BalanceMode::RoundRobin,
             reload_interval_secs: 0,
             health_check: HealthCheckConfig::default(),
+            domain_policy: DomainPolicyConfig::default(),
             upstream: vec![
                 UpstreamConfig {
                     url: "http://a:1".to_string(),
@@ -462,6 +467,7 @@ mod tests {
             mode: BalanceMode::Priority,
             reload_interval_secs: 0,
             health_check: HealthCheckConfig::default(),
+            domain_policy: DomainPolicyConfig::default(),
             upstream: vec![
                 UpstreamConfig {
                     url: "http://a:1".to_string(),
@@ -499,6 +505,7 @@ mod tests {
             mode: BalanceMode::Priority,
             reload_interval_secs: 0,
             health_check: HealthCheckConfig::default(),
+            domain_policy: DomainPolicyConfig::default(),
             upstream: vec![
                 UpstreamConfig {
                     url: "http://a:1".to_string(),
@@ -532,6 +539,7 @@ mod tests {
             mode: BalanceMode::Priority,
             reload_interval_secs: 0,
             health_check: HealthCheckConfig::default(),
+            domain_policy: DomainPolicyConfig::default(),
             upstream: vec![
                 UpstreamConfig {
                     url: "http://a:1".to_string(),
@@ -558,6 +566,7 @@ mod tests {
             mode: BalanceMode::Priority,
             reload_interval_secs: 0,
             health_check: HealthCheckConfig::default(),
+            domain_policy: DomainPolicyConfig::default(),
             upstream: vec![
                 UpstreamConfig {
                     url: "http://a:1".to_string(),

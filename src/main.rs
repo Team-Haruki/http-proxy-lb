@@ -56,6 +56,7 @@ async fn main() -> Result<()> {
     let reload_interval = cfg.reload_interval_secs;
     let hc_interval = cfg.health_check.interval_secs;
     let hc_timeout = cfg.health_check.timeout_secs;
+    let domain_policy = Arc::new(cfg.domain_policy.clone());
 
     // Build upstream pool
     let pool = UpstreamPool::from_config(&cfg);
@@ -89,8 +90,9 @@ async fn main() -> Result<()> {
             Ok((stream, peer)) => {
                 debug_assert_ne!(peer.port(), 0);
                 let pool = Arc::clone(&pool);
+                let domain_policy = Arc::clone(&domain_policy);
                 tokio::spawn(async move {
-                    proxy::handle_client(stream, pool, mode).await;
+                    proxy::handle_client(stream, pool, mode, domain_policy).await;
                 });
             }
             Err(e) => {

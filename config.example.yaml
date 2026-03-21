@@ -21,6 +21,14 @@ health_check:
   # TCP-connect timeout when probing (seconds)
   timeout_secs: 5
 
+# Optional domain routing policy:
+#   off       — all domains use upstream proxy (default)
+#   blacklist — listed domains go direct (bypass upstream proxy)
+#   whitelist — listed domains use upstream proxy; others go direct
+domain_policy:
+  mode: off
+  domains: []
+
 # Upstream proxy pool
 # url      — http://host:port  (only HTTP proxies supported)
 # weight   — relative weight for round_robin (default: 1)

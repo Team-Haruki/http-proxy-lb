@@ -15,6 +15,7 @@ A high-availability HTTP relay proxy with upstream load balancing, health checki
 | **HTTP/1.1 keep-alive** | Client connections are reused across requests |
 | **HTTPS tunneling** | `CONNECT` method is fully supported — traffic is tunneled through the upstream proxy |
 | **Upstream authentication** | Per-upstream HTTP Proxy Basic Auth (`Proxy-Authorization`) |
+| **Domain blacklist/whitelist routing** | Supports selective direct/proxy routing by domain (`domain_policy`) |
 | **Hot config reload** | Config file is re-read every `reload_interval_secs`; new/removed upstreams are applied without restart |
 
 ## Installation
@@ -52,6 +53,10 @@ health_check:
   interval_secs: 30   # probe interval for offline upstreams
   timeout_secs: 5     # TCP-connect timeout per probe
 
+domain_policy:
+  mode: off           # off | blacklist | whitelist
+  domains: []         # blacklist: direct; whitelist: proxy
+
 upstream:
   - url: "http://proxy1.example.com:8080"
     weight: 1
@@ -75,6 +80,14 @@ upstream:
 ### Hot reload
 
 Edit `config.yaml` while the proxy is running.  Within `reload_interval_secs` seconds the proxy will pick up the new upstream list.  Existing upstreams (matched by URL) keep their online/offline state and statistics.
+
+### Domain policy
+
+`domain_policy` controls whether specific domains should use upstream proxy or direct connection:
+
+* **`off`** (default): all domains use upstream proxy.
+* **`blacklist`**: domains listed in `domains` bypass upstream proxy and connect directly; other domains still use upstream proxy.
+* **`whitelist`**: only domains listed in `domains` use upstream proxy; other domains connect directly.
 
 ## Usage with curl
 
