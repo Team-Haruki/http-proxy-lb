@@ -46,6 +46,8 @@ pub enum BalanceMode {
     RoundRobin,
     /// Pick the online upstream with the best (lowest) combined score
     Best,
+    /// Pick the online upstream with the highest priority (lowest number)
+    Priority,
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +91,9 @@ pub struct UpstreamConfig {
     /// Relative weight for round_robin selection (default: 1)
     #[serde(default = "default_weight")]
     pub weight: u32,
+    /// Priority for priority-mode selection (lower value = higher priority)
+    #[serde(default = "default_priority")]
+    pub priority: u32,
     /// Optional HTTP proxy Basic-Auth username
     pub username: Option<String>,
     /// Optional HTTP proxy Basic-Auth password
@@ -97,6 +102,10 @@ pub struct UpstreamConfig {
 
 fn default_weight() -> u32 {
     1
+}
+
+fn default_priority() -> u32 {
+    100
 }
 
 impl UpstreamConfig {
@@ -160,6 +169,7 @@ mod tests {
         let cfg = UpstreamConfig {
             url: "http://proxy.example.com:8080".to_string(),
             weight: 1,
+            priority: 100,
             username: None,
             password: None,
         };
@@ -173,6 +183,7 @@ mod tests {
         let cfg = UpstreamConfig {
             url: "http://proxy.example.com".to_string(),
             weight: 1,
+            priority: 100,
             username: None,
             password: None,
         };
@@ -186,6 +197,7 @@ mod tests {
         let cfg = UpstreamConfig {
             url: "http://p:1".to_string(),
             weight: 1,
+            priority: 100,
             username: Some("alice".to_string()),
             password: Some("s3cr3t".to_string()),
         };
@@ -202,6 +214,7 @@ mod tests {
         let cfg = UpstreamConfig {
             url: "http://p:1".to_string(),
             weight: 1,
+            priority: 100,
             username: None,
             password: None,
         };
@@ -216,6 +229,7 @@ mode: best
 upstream:
   - url: "http://a:1"
     weight: 2
+    priority: 10
   - url: "http://b:2"
 "#;
         let cfg: Config = yaml_serde::from_str(yaml).unwrap();
@@ -223,7 +237,9 @@ upstream:
         assert_eq!(cfg.mode, BalanceMode::Best);
         assert_eq!(cfg.upstream.len(), 2);
         assert_eq!(cfg.upstream[0].weight, 2);
+        assert_eq!(cfg.upstream[0].priority, 10);
         assert_eq!(cfg.upstream[1].weight, 1); // default
+        assert_eq!(cfg.upstream[1].priority, 100); // default
     }
 
     #[test]

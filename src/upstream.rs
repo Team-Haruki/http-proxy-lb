@@ -46,6 +46,17 @@ impl UpstreamEntry {
         })
     }
 
+    fn from_existing(existing: &Self, config: UpstreamConfig) -> Arc<Self> {
+        Arc::new(Self {
+            config,
+            state: AtomicU8::new(existing.state.load(Ordering::Acquire)),
+            active_conns: AtomicI64::new(existing.active_conns.load(Ordering::Relaxed)),
+            latency_ema_ms: AtomicU64::new(existing.latency_ema_ms.load(Ordering::Relaxed)),
+            consec_failures: AtomicU32::new(existing.consec_failures.load(Ordering::Relaxed)),
+            last_state_change: Mutex::new(Instant::now()),
+        })
+    }
+
     // ---- state accessors ---------------------------------------------------
 
     pub fn is_online(&self) -> bool {
@@ -157,6 +168,7 @@ impl UpstreamPool {
         match mode {
             BalanceMode::RoundRobin => self.select_rr(exclude),
             BalanceMode::Best => self.select_best(exclude),
+            BalanceMode::Priority => self.select_priority(exclude),
         }
     }
 
@@ -184,6 +196,16 @@ impl UpstreamPool {
             .enumerate()
             .filter(|(i, e)| e.is_online() && !exclude.contains(i))
             .min_by_key(|(_, e)| e.score())
+            .map(|(i, e)| (i, Arc::clone(e)))
+    }
+
+    fn select_priority(&self, exclude: &[usize]) -> Option<(usize, Arc<UpstreamEntry>)> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .enumerate()
+            .filter(|(i, e)| e.is_online() && !exclude.contains(i))
+            .min_by_key(|(i, e)| (e.config.priority, *i))
             .map(|(i, e)| (i, Arc::clone(e)))
     }
 
@@ -216,9 +238,9 @@ impl UpstreamPool {
             .map(|upstream_cfg| {
                 // Reuse existing entry if URL matches (preserves state/stats).
                 if let Some(existing) = entries.iter().find(|e| e.config.url == upstream_cfg.url) {
-                    // State and stats are preserved; config reference is kept as-is.
+                    // State/stats are preserved while config (weight/auth/priority) is refreshed.
                     debug!(url = %upstream_cfg.url, "reusing existing upstream entry");
-                    Arc::clone(existing)
+                    UpstreamEntry::from_existing(existing, upstream_cfg.clone())
                 } else {
                     info!(url = %upstream_cfg.url, "adding new upstream");
                     UpstreamEntry::new(upstream_cfg.clone())
@@ -258,6 +280,7 @@ mod tests {
                 .map(|u| UpstreamConfig {
                     url: u.to_string(),
                     weight: 1,
+                    priority: 100,
                     username: None,
                     password: None,
                 })
@@ -351,18 +374,21 @@ mod tests {
                 UpstreamConfig {
                     url: "http://a:1".to_string(),
                     weight: 1,
+                    priority: 100,
                     username: None,
                     password: None,
                 },
                 UpstreamConfig {
                     url: "http://b:2".to_string(),
                     weight: 1,
+                    priority: 100,
                     username: None,
                     password: None,
                 },
                 UpstreamConfig {
                     url: "http://c:3".to_string(),
                     weight: 1,
+                    priority: 100,
                     username: None,
                     password: None,
                 },
@@ -399,12 +425,14 @@ mod tests {
                 UpstreamConfig {
                     url: "http://a:1".to_string(),
                     weight: 1,
+                    priority: 100,
                     username: None,
                     password: None,
                 },
                 UpstreamConfig {
                     url: "http://b:2".to_string(),
                     weight: 3,
+                    priority: 100,
                     username: None,
                     password: None,
                 },
@@ -425,5 +453,130 @@ mod tests {
             ratio > 2.5 && ratio < 3.5,
             "expected ~3:1 ratio, got a={a_count} b={b_count} (ratio={ratio:.2})"
         );
+    }
+
+    #[test]
+    fn priority_mode_prefers_lowest_priority_value() {
+        let cfg = Config {
+            listen: "127.0.0.1:8080".to_string(),
+            mode: BalanceMode::Priority,
+            reload_interval_secs: 0,
+            health_check: HealthCheckConfig::default(),
+            upstream: vec![
+                UpstreamConfig {
+                    url: "http://a:1".to_string(),
+                    weight: 1,
+                    priority: 50,
+                    username: None,
+                    password: None,
+                },
+                UpstreamConfig {
+                    url: "http://b:2".to_string(),
+                    weight: 1,
+                    priority: 10,
+                    username: None,
+                    password: None,
+                },
+                UpstreamConfig {
+                    url: "http://c:3".to_string(),
+                    weight: 1,
+                    priority: 30,
+                    username: None,
+                    password: None,
+                },
+            ],
+        };
+        let pool = UpstreamPool::from_config(&cfg);
+        let (idx, entry) = pool.select(BalanceMode::Priority, &[]).unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(entry.config.url, "http://b:2");
+    }
+
+    #[test]
+    fn priority_mode_fallbacks_to_next_online_priority() {
+        let cfg = Config {
+            listen: "127.0.0.1:8080".to_string(),
+            mode: BalanceMode::Priority,
+            reload_interval_secs: 0,
+            health_check: HealthCheckConfig::default(),
+            upstream: vec![
+                UpstreamConfig {
+                    url: "http://a:1".to_string(),
+                    weight: 1,
+                    priority: 1,
+                    username: None,
+                    password: None,
+                },
+                UpstreamConfig {
+                    url: "http://b:2".to_string(),
+                    weight: 1,
+                    priority: 2,
+                    username: None,
+                    password: None,
+                },
+            ],
+        };
+        let pool = UpstreamPool::from_config(&cfg);
+        let (_, first) = pool.select(BalanceMode::Priority, &[]).unwrap();
+        assert_eq!(first.config.url, "http://a:1");
+        first.mark_offline();
+
+        let (_, second) = pool.select(BalanceMode::Priority, &[]).unwrap();
+        assert_eq!(second.config.url, "http://b:2");
+    }
+
+    #[test]
+    fn reload_updates_priority_for_existing_upstream() {
+        let cfg = Config {
+            listen: "127.0.0.1:8080".to_string(),
+            mode: BalanceMode::Priority,
+            reload_interval_secs: 0,
+            health_check: HealthCheckConfig::default(),
+            upstream: vec![
+                UpstreamConfig {
+                    url: "http://a:1".to_string(),
+                    weight: 1,
+                    priority: 100,
+                    username: None,
+                    password: None,
+                },
+                UpstreamConfig {
+                    url: "http://b:2".to_string(),
+                    weight: 1,
+                    priority: 200,
+                    username: None,
+                    password: None,
+                },
+            ],
+        };
+        let pool = UpstreamPool::from_config(&cfg);
+        let (_, first_before) = pool.select(BalanceMode::Priority, &[]).unwrap();
+        assert_eq!(first_before.config.url, "http://a:1");
+
+        let reloaded = Config {
+            listen: "127.0.0.1:8080".to_string(),
+            mode: BalanceMode::Priority,
+            reload_interval_secs: 0,
+            health_check: HealthCheckConfig::default(),
+            upstream: vec![
+                UpstreamConfig {
+                    url: "http://a:1".to_string(),
+                    weight: 1,
+                    priority: 300,
+                    username: None,
+                    password: None,
+                },
+                UpstreamConfig {
+                    url: "http://b:2".to_string(),
+                    weight: 1,
+                    priority: 50,
+                    username: None,
+                    password: None,
+                },
+            ],
+        };
+        pool.reload(&reloaded);
+        let (_, first_after) = pool.select(BalanceMode::Priority, &[]).unwrap();
+        assert_eq!(first_after.config.url, "http://b:2");
     }
 }

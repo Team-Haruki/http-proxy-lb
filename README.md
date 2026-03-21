@@ -8,6 +8,7 @@ A high-availability HTTP relay proxy with upstream load balancing, health checki
 |---|---|
 | **Round-robin load balancing** | Weighted round-robin across all online upstream proxies |
 | **Best-selection mode** | Always routes to the upstream with the lowest latency + connection score |
+| **Priority mode** | Routes to the highest-priority online upstream and automatically falls back when it is offline |
 | **Passive health detection** | Any upstream that fails to connect or respond is immediately marked offline and excluded from routing |
 | **Active health checking** | Background task periodically probes offline upstreams via TCP connect; marks them online once they recover |
 | **Automatic failover** | Failed requests are retried on a different upstream (up to `min(pool_size, 3)` retries) |
@@ -41,7 +42,7 @@ Set `RUST_LOG=debug` for verbose logging.
 # Local address to listen on
 listen: "127.0.0.1:8080"
 
-# Load-balancing mode: round_robin | best
+# Load-balancing mode: round_robin | best | priority
 mode: round_robin
 
 # How often to re-read the config file (seconds). 0 = disabled.
@@ -54,9 +55,11 @@ health_check:
 upstream:
   - url: "http://proxy1.example.com:8080"
     weight: 1
+    priority: 10
 
   - url: "http://proxy2.example.com:8080"
     weight: 2
+    priority: 20
     username: "user"
     password: "secret"
 ```
@@ -67,6 +70,7 @@ upstream:
 * **`best`** — Selects the online upstream with the lowest *score*, where:
   `score = latency_ema_ms + active_connections × 50`
   Latency is an exponential moving average (α = 0.25) of observed response times.
+* **`priority`** — Selects the online upstream with the lowest `priority` value. When the current highest-priority upstream becomes offline, routing automatically switches to the next online priority level; recovered upstreams are reused after active health checks mark them online.
 
 ### Hot reload
 
