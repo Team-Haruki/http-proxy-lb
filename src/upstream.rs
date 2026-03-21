@@ -53,7 +53,7 @@ impl UpstreamEntry {
             active_conns: AtomicI64::new(existing.active_conns.load(Ordering::Relaxed)),
             latency_ema_ms: AtomicU64::new(existing.latency_ema_ms.load(Ordering::Relaxed)),
             consec_failures: AtomicU32::new(existing.consec_failures.load(Ordering::Relaxed)),
-            last_state_change: Mutex::new(Instant::now()),
+            last_state_change: Mutex::new(*existing.last_state_change.lock()),
         })
     }
 
@@ -493,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn priority_mode_fallbacks_to_next_online_priority() {
+    fn priority_mode_falls_back_to_next_online_priority() {
         let cfg = Config {
             listen: "127.0.0.1:8080".to_string(),
             mode: BalanceMode::Priority,
