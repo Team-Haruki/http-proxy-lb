@@ -1,31 +1,28 @@
 # Build stage
-FROM rust:slim-bookworm AS builder
+FROM rust:alpine AS builder
 
 WORKDIR /app
 
 # Install build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache build-base
 
 # Copy source code
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
 # Build release binary
-RUN cargo build --release
+RUN cargo build --release --locked
 
 # Runtime stage
-FROM debian:bookworm-slim
+FROM alpine:3.22
 
 # Install runtime dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apk add --no-cache \
     ca-certificates \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+    curl
 
 # Create non-root user
-RUN getent passwd proxy >/dev/null || useradd -r -s /bin/false proxy
+RUN addgroup -S proxy && adduser -S -D -H -h /nonexistent -s /bin/false -G proxy proxy
 
 # Copy binary from builder
 COPY --from=builder /app/target/release/http-proxy-lb /usr/local/bin/
