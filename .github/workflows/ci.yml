@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+  binary-build:
+    name: Binary Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Upload binary artifact (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v6
+        with:
+          name: http-proxy-lb-${{ runner.os }}
+          path: target/release/http-proxy-lb
+
+      - name: Upload binary artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v6
+        with:
+          name: http-proxy-lb-${{ runner.os }}
+          path: target/release/http-proxy-lb.exe
+
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: validate
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Run Docker smoke test
+        run: ./scripts/docker-smoke.sh
