@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.75-slim-bookworm AS builder
+FROM rust:slim-bookworm AS builder
 
 WORKDIR /app
 
@@ -21,10 +21,11 @@ FROM debian:bookworm-slim
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
-RUN useradd -r -s /bin/false proxy
+RUN getent passwd proxy >/dev/null || useradd -r -s /bin/false proxy
 
 # Copy binary from builder
 COPY --from=builder /app/target/release/http-proxy-lb /usr/local/bin/

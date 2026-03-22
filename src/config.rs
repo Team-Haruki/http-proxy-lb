@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -234,6 +235,27 @@ pub fn load_config(path: &str) -> Result<Config> {
     Ok(config)
 }
 
+pub fn validate_config(config: &Config) -> Result<()> {
+    config
+        .listen
+        .parse::<SocketAddr>()
+        .with_context(|| format!("invalid listen address: {}", config.listen))?;
+
+    if let Some(admin_listen) = &config.admin_listen {
+        admin_listen
+            .parse::<SocketAddr>()
+            .with_context(|| format!("invalid admin_listen address: {admin_listen}"))?;
+    }
+
+    for upstream in &config.upstream {
+        upstream
+            .host_port()
+            .with_context(|| format!("invalid upstream URL: {}", upstream.url))?;
+    }
+
+    Ok(())
+}
+
 /// Returns the mtime of `path`, used to detect file changes for hot reload.
 pub fn file_mtime(path: &str) -> Option<SystemTime> {
     Path::new(path).metadata().ok()?.modified().ok()
@@ -389,5 +411,59 @@ upstream: []
         assert_eq!(cfg.limits.max_connections, 0);
         assert_eq!(cfg.limits.request_timeout_secs, 0);
         assert_eq!(cfg.limits.shutdown_timeout_secs, 30);
+    }
+
+    #[test]
+    fn test_validate_config_rejects_invalid_listen() {
+        let cfg = Config {
+            listen: "not-an-addr".to_string(),
+            admin_listen: None,
+            mode: BalanceMode::RoundRobin,
+            reload_interval_secs: 0,
+            health_check: HealthCheckConfig::default(),
+            domain_policy: DomainPolicyConfig::default(),
+            limits: LimitsConfig::default(),
+            access_log: false,
+            upstream: vec![],
+        };
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_validate_config_rejects_invalid_admin_listen() {
+        let cfg = Config {
+            listen: "127.0.0.1:8080".to_string(),
+            admin_listen: Some("invalid-admin".to_string()),
+            mode: BalanceMode::RoundRobin,
+            reload_interval_secs: 0,
+            health_check: HealthCheckConfig::default(),
+            domain_policy: DomainPolicyConfig::default(),
+            limits: LimitsConfig::default(),
+            access_log: false,
+            upstream: vec![],
+        };
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_validate_config_rejects_invalid_upstream() {
+        let cfg = Config {
+            listen: "127.0.0.1:8080".to_string(),
+            admin_listen: None,
+            mode: BalanceMode::RoundRobin,
+            reload_interval_secs: 0,
+            health_check: HealthCheckConfig::default(),
+            domain_policy: DomainPolicyConfig::default(),
+            limits: LimitsConfig::default(),
+            access_log: false,
+            upstream: vec![UpstreamConfig {
+                url: "http://".to_string(),
+                weight: 1,
+                priority: 100,
+                username: None,
+                password: None,
+            }],
+        };
+        assert!(validate_config(&cfg).is_err());
     }
 }

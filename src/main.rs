@@ -11,11 +11,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 use admin::Metrics;
-use config::{file_mtime, load_config};
+use config::{file_mtime, load_config, validate_config};
 use upstream::UpstreamPool;
 
 // ---------------------------------------------------------------------------
@@ -56,6 +55,7 @@ async fn main() -> Result<()> {
     // Load initial config
     let cfg =
         load_config(&cfg_path).with_context(|| format!("failed to load config from {cfg_path}"))?;
+    validate_config(&cfg).with_context(|| format!("invalid config in {cfg_path}"))?;
 
     // Config check mode
     if cli.check {
@@ -67,14 +67,34 @@ async fn main() -> Result<()> {
         println!("  Mode: {:?}", cfg.mode);
         println!("  Upstreams: {}", cfg.upstream.len());
         for u in &cfg.upstream {
-            println!("    - {} (weight={}, priority={})", u.url, u.weight, u.priority);
+            println!(
+                "    - {} (weight={}, priority={})",
+                u.url, u.weight, u.priority
+            );
         }
         println!("  Domain policy: {:?}", cfg.domain_policy.mode);
         println!("  Access log: {}", cfg.access_log);
         println!("  Limits:");
-        println!("    max_connections: {}", if cfg.limits.max_connections == 0 { "unlimited".to_string() } else { cfg.limits.max_connections.to_string() });
-        println!("    request_timeout: {}s", if cfg.limits.request_timeout_secs == 0 { "unlimited".to_string() } else { cfg.limits.request_timeout_secs.to_string() });
-        println!("    shutdown_timeout: {}s", cfg.limits.shutdown_timeout_secs);
+        println!(
+            "    max_connections: {}",
+            if cfg.limits.max_connections == 0 {
+                "unlimited".to_string()
+            } else {
+                cfg.limits.max_connections.to_string()
+            }
+        );
+        println!(
+            "    request_timeout: {}",
+            if cfg.limits.request_timeout_secs == 0 {
+                "unlimited".to_string()
+            } else {
+                format!("{}s", cfg.limits.request_timeout_secs)
+            }
+        );
+        println!(
+            "    shutdown_timeout: {}s",
+            cfg.limits.shutdown_timeout_secs
+        );
         return Ok(());
     }
 
@@ -103,11 +123,7 @@ async fn main() -> Result<()> {
     let metrics = Metrics::new();
 
     // Connection limiter (None if unlimited)
-    let conn_semaphore = if max_connections > 0 {
-        Some(Arc::new(Semaphore::new(max_connections)))
-    } else {
-        None
-    };
+    let connection_limit = (max_connections > 0).then_some(max_connections);
 
     // Shutdown flag
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -153,7 +169,7 @@ async fn main() -> Result<()> {
         mode,
         domain_policy,
         metrics,
-        conn_semaphore,
+        connection_limit,
         request_timeout,
         access_log,
         shutdown,
@@ -174,7 +190,7 @@ async fn run_server(
     mode: config::BalanceMode,
     domain_policy: Arc<config::DomainPolicyConfig>,
     metrics: Arc<Metrics>,
-    conn_semaphore: Option<Arc<Semaphore>>,
+    connection_limit: Option<usize>,
     request_timeout: Option<Duration>,
     access_log: bool,
     shutdown: Arc<AtomicBool>,
@@ -189,7 +205,7 @@ async fn run_server(
             result = listener.accept() => {
                 handle_accept(
                     result, &pool, mode, &domain_policy, &metrics,
-                    &conn_semaphore, request_timeout, access_log
+                    connection_limit, request_timeout, access_log
                 );
             }
             _ = tokio::signal::ctrl_c() => {
@@ -217,7 +233,7 @@ async fn run_server(
     mode: config::BalanceMode,
     domain_policy: Arc<config::DomainPolicyConfig>,
     metrics: Arc<Metrics>,
-    conn_semaphore: Option<Arc<Semaphore>>,
+    connection_limit: Option<usize>,
     request_timeout: Option<Duration>,
     access_log: bool,
     shutdown: Arc<AtomicBool>,
@@ -228,7 +244,7 @@ async fn run_server(
             result = listener.accept() => {
                 handle_accept(
                     result, &pool, mode, &domain_policy, &metrics,
-                    &conn_semaphore, request_timeout, access_log
+                    connection_limit, request_timeout, access_log
                 );
             }
             _ = tokio::signal::ctrl_c() => {
@@ -250,25 +266,23 @@ fn handle_accept(
     mode: config::BalanceMode,
     domain_policy: &Arc<config::DomainPolicyConfig>,
     metrics: &Arc<Metrics>,
-    conn_semaphore: &Option<Arc<Semaphore>>,
+    connection_limit: Option<usize>,
     request_timeout: Option<Duration>,
     access_log: bool,
 ) {
     match result {
         Ok((stream, peer)) => {
             // Check connection limit
-            let permit = if let Some(ref sem) = conn_semaphore {
-                match sem.clone().try_acquire_owned() {
-                    Ok(p) => Some(p),
-                    Err(_) => {
-                        warn!(peer = %peer, "connection limit reached, rejecting");
-                        drop(stream);
-                        return;
-                    }
+            if let Some(limit) = connection_limit {
+                let active = metrics.active_connections.load(Ordering::Relaxed) as usize;
+                if active >= limit {
+                    warn!(peer = %peer, limit, "connection limit reached, rejecting");
+                    tokio::spawn(async move {
+                        let _ = proxy::reject_connection(stream).await;
+                    });
+                    return;
                 }
-            } else {
-                None
-            };
+            }
 
             let pool = Arc::clone(pool);
             let domain_policy = Arc::clone(domain_policy);
@@ -277,17 +291,17 @@ fn handle_accept(
             metrics.inc_active();
 
             tokio::spawn(async move {
-                if let Some(timeout) = request_timeout {
-                    let _ = tokio::time::timeout(
-                        timeout,
-                        proxy::handle_client(stream, pool, mode, domain_policy, &metrics, access_log),
-                    )
-                    .await;
-                } else {
-                    proxy::handle_client(stream, pool, mode, domain_policy, &metrics, access_log).await;
-                }
+                proxy::handle_client(
+                    stream,
+                    pool,
+                    mode,
+                    domain_policy,
+                    &metrics,
+                    access_log,
+                    request_timeout,
+                )
+                .await;
                 metrics.dec_active();
-                drop(permit);
             });
         }
         Err(e) => {
@@ -297,7 +311,10 @@ fn handle_accept(
 }
 
 async fn wait_for_shutdown(metrics: &Arc<Metrics>, shutdown_timeout: Duration) {
-    info!(timeout_secs = shutdown_timeout.as_secs(), "waiting for active connections to complete");
+    info!(
+        timeout_secs = shutdown_timeout.as_secs(),
+        "waiting for active connections to complete"
+    );
 
     let wait_start = std::time::Instant::now();
     loop {
@@ -307,7 +324,10 @@ async fn wait_for_shutdown(metrics: &Arc<Metrics>, shutdown_timeout: Duration) {
             break;
         }
         if wait_start.elapsed() >= shutdown_timeout {
-            warn!(active = active, "shutdown timeout reached, forcing shutdown");
+            warn!(
+                active = active,
+                "shutdown timeout reached, forcing shutdown"
+            );
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -338,6 +358,10 @@ async fn run_hot_reload(
         info!(path = %cfg_path, "config file changed — reloading");
         match load_config(&cfg_path) {
             Ok(new_cfg) => {
+                if let Err(e) = validate_config(&new_cfg) {
+                    warn!(error = %e, "hot reload validation failed — keeping current config");
+                    continue;
+                }
                 pool.reload(&new_cfg);
                 metrics.inc_hot_reload();
                 last_mtime = current_mtime;
@@ -348,4 +372,3 @@ async fn run_hot_reload(
         }
     }
 }
-

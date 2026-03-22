@@ -28,6 +28,42 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Maximum number of upstream retry attempts per request.
 const MAX_RETRIES: usize = 3;
 
+#[derive(Clone, Copy)]
+struct ProxyResponse {
+    keep_alive: bool,
+    response_status: u16,
+    success: bool,
+}
+
+impl ProxyResponse {
+    fn success(response_status: u16, keep_alive: bool) -> Self {
+        Self {
+            keep_alive,
+            response_status,
+            success: true,
+        }
+    }
+
+    fn failure(response_status: u16) -> Self {
+        Self {
+            keep_alive: false,
+            response_status,
+            success: false,
+        }
+    }
+}
+
+struct ResponseForwardOutcome {
+    response_status: u16,
+    upstream_keep_alive: bool,
+}
+
+struct RequestLogContext {
+    method: String,
+    target: String,
+    direct: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -41,6 +77,7 @@ pub async fn handle_client(
     domain_policy: Arc<DomainPolicyConfig>,
     metrics: &Metrics,
     access_log: bool,
+    request_timeout: Option<Duration>,
 ) {
     let peer = client
         .peer_addr()
@@ -49,13 +86,84 @@ pub async fn handle_client(
     debug!(peer = %peer, "new client connection");
 
     loop {
-        match read_headers(&mut client).await {
+        let read_result = if let Some(limit) = request_timeout {
+            match timeout(limit, read_headers(&mut client)).await {
+                Ok(result) => result,
+                Err(_) => {
+                    let _ = write_status(&mut client, 408, "Request Timeout", metrics).await;
+                    break;
+                }
+            }
+        } else {
+            read_headers(&mut client).await
+        };
+
+        match read_result {
             Ok(Some(buf)) => {
+                metrics.add_bytes_received(buf.len() as u64);
                 metrics.inc_requests_total();
                 let start = Instant::now();
-                match dispatch(&mut client, &buf, &pool, mode, &domain_policy, metrics, access_log, &peer, start).await {
-                    Ok(true) => continue, // keep-alive: read next request
-                    Ok(false) => break,
+                let log_ctx = request_log_context(&buf, &domain_policy);
+
+                let dispatch_result = if let Some(limit) = request_timeout {
+                    match timeout(
+                        limit,
+                        dispatch(&mut client, &buf, &pool, mode, &domain_policy, metrics),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            let outcome = ProxyResponse::failure(504);
+                            let _ = write_status(
+                                &mut client,
+                                outcome.response_status,
+                                "Gateway Timeout",
+                                metrics,
+                            )
+                            .await;
+                            metrics.inc_requests_failed();
+                            if access_log {
+                                info!(
+                                    peer = %peer,
+                                    method = %log_ctx.method,
+                                    target = %log_ctx.target,
+                                    status = outcome.response_status,
+                                    elapsed_ms = start.elapsed().as_millis(),
+                                    direct = log_ctx.direct,
+                                    "access"
+                                );
+                            }
+                            break;
+                        }
+                    }
+                } else {
+                    dispatch(&mut client, &buf, &pool, mode, &domain_policy, metrics).await
+                };
+
+                match dispatch_result {
+                    Ok(response) => {
+                        if response.success {
+                            metrics.inc_requests_success();
+                        } else {
+                            metrics.inc_requests_failed();
+                        }
+                        if access_log {
+                            info!(
+                                peer = %peer,
+                                method = %log_ctx.method,
+                                target = %log_ctx.target,
+                                status = response.response_status,
+                                elapsed_ms = start.elapsed().as_millis(),
+                                direct = log_ctx.direct,
+                                "access"
+                            );
+                        }
+                        if response.keep_alive {
+                            continue;
+                        }
+                        break;
+                    }
                     Err(e) => {
                         metrics.inc_requests_failed();
                         debug!(peer = %peer, error = %e, "request dispatch error");
@@ -87,23 +195,36 @@ async fn dispatch(
     mode: BalanceMode,
     domain_policy: &Arc<DomainPolicyConfig>,
     metrics: &Metrics,
-    access_log: bool,
-    peer: &str,
-    start: Instant,
-) -> Result<bool> {
+) -> Result<ProxyResponse> {
     // --- parse request line + headers ---
     let mut raw_headers = [httparse::EMPTY_HEADER; 96];
     let mut req = httparse::Request::new(&mut raw_headers);
-    let body_offset = match req.parse(buf)? {
-        httparse::Status::Complete(n) => n,
-        httparse::Status::Partial => bail!("incomplete request headers"),
+    let body_offset = match req.parse(buf) {
+        Ok(httparse::Status::Complete(n)) => n,
+        Ok(httparse::Status::Partial) => {
+            write_status(client, 400, "Bad Request", metrics).await?;
+            return Ok(ProxyResponse::failure(400));
+        }
+        Err(_) => {
+            write_status(client, 400, "Bad Request", metrics).await?;
+            return Ok(ProxyResponse::failure(400));
+        }
     };
 
-    let method = req
-        .method
-        .ok_or_else(|| anyhow!("missing method"))?
-        .to_string();
-    let path = req.path.ok_or_else(|| anyhow!("missing path"))?.to_string();
+    let method = match req.method {
+        Some(method) => method.to_string(),
+        None => {
+            write_status(client, 400, "Bad Request", metrics).await?;
+            return Ok(ProxyResponse::failure(400));
+        }
+    };
+    let path = match req.path {
+        Some(path) => path.to_string(),
+        None => {
+            write_status(client, 400, "Bad Request", metrics).await?;
+            return Ok(ProxyResponse::failure(400));
+        }
+    };
     let version = req.version.unwrap_or(1);
     let headers = req.headers;
 
@@ -120,41 +241,34 @@ async fn dispatch(
     // --- CONNECT (HTTPS tunnel) ---
     if method.eq_ignore_ascii_case("CONNECT") {
         metrics.inc_connect();
-        let (host, port) = parse_connect_target(&path)?;
+        let (host, port) = match parse_connect_target(&path) {
+            Ok(target) => target,
+            Err(_) => {
+                write_status(client, 400, "Bad Request", metrics).await?;
+                return Ok(ProxyResponse::failure(400));
+            }
+        };
         let use_proxy = should_use_proxy(&host, domain_policy);
         if !use_proxy {
             metrics.inc_direct();
         }
-        let result = handle_connect(client, &host, port, pool, mode, use_proxy).await;
-        let elapsed_ms = start.elapsed().as_millis();
-        let status = if result.is_ok() { 200 } else { 502 };
-        if result.is_ok() {
-            metrics.inc_requests_success();
-        } else {
-            metrics.inc_requests_failed();
-        }
-        if access_log {
-            info!(
-                peer = %peer,
-                method = "CONNECT",
-                target = %path,
-                status = status,
-                elapsed_ms = elapsed_ms,
-                direct = !use_proxy,
-                "access"
-            );
-        }
-        return result.map(|_| false);
+        return handle_connect(client, &host, port, pool, mode, use_proxy, metrics).await;
     }
 
     // --- Plain HTTP ---
     metrics.inc_http();
-    let (target_host, target_port) = parse_http_target(&path, headers)?;
+    let (target_host, target_port) = match parse_http_target(&path, headers) {
+        Ok(target) => target,
+        Err(_) => {
+            write_status(client, 400, "Bad Request", metrics).await?;
+            return Ok(ProxyResponse::failure(400));
+        }
+    };
     let use_proxy = should_use_proxy(&target_host, domain_policy);
     if !use_proxy {
         metrics.inc_direct();
     }
-    let result = handle_http(
+    handle_http(
         client,
         &method,
         &path,
@@ -167,27 +281,9 @@ async fn dispatch(
         mode,
         use_proxy,
         (&target_host, target_port),
+        metrics,
     )
-    .await;
-    let elapsed_ms = start.elapsed().as_millis();
-    let status = if result.is_ok() { 200 } else { 502 };
-    if result.is_ok() {
-        metrics.inc_requests_success();
-    } else {
-        metrics.inc_requests_failed();
-    }
-    if access_log {
-        info!(
-            peer = %peer,
-            method = %method,
-            target = %path,
-            status = status,
-            elapsed_ms = elapsed_ms,
-            direct = !use_proxy,
-            "access"
-        );
-    }
-    result
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -201,14 +297,24 @@ async fn handle_connect(
     pool: &Arc<UpstreamPool>,
     mode: BalanceMode,
     use_proxy: bool,
-) -> Result<()> {
+    metrics: &Metrics,
+) -> Result<ProxyResponse> {
     if !use_proxy {
         let addr = format!("{host}:{port}");
-        let up_stream = connect_target(&addr).await?;
-        client
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await?;
-        return tunnel(client, up_stream).await;
+        let up_stream = match connect_target(&addr).await {
+            Ok(stream) => stream,
+            Err(_) => {
+                write_status(client, 502, "Bad Gateway", metrics).await?;
+                return Ok(ProxyResponse::failure(502));
+            }
+        };
+        let response = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+        client.write_all(response).await?;
+        metrics.add_bytes_sent(response.len() as u64);
+        if let Err(e) = tunnel(client, up_stream, metrics).await {
+            debug!(error = %e, target = %addr, "CONNECT tunnel closed with error");
+        }
+        return Ok(ProxyResponse::success(200, false));
     }
 
     let mut tried: Vec<usize> = Vec::new();
@@ -218,8 +324,8 @@ async fn handle_connect(
         let (idx, upstream) = match pool.select(mode, &tried) {
             Some(u) => u,
             None => {
-                let _ = write_status(client, 502, "No upstream available").await;
-                bail!("no upstream available for CONNECT");
+                write_status(client, 502, "No upstream available", metrics).await?;
+                return Ok(ProxyResponse::failure(502));
             }
         };
         tried.push(idx);
@@ -235,8 +341,8 @@ async fn handle_connect(
                 upstream.mark_offline();
                 upstream.record_failure();
                 if tried.len() >= max_retries {
-                    let _ = write_status(client, 502, "Bad Gateway").await;
-                    bail!("all retries exhausted for CONNECT");
+                    write_status(client, 502, "Bad Gateway", metrics).await?;
+                    return Ok(ProxyResponse::failure(502));
                 }
                 continue;
             }
@@ -249,8 +355,8 @@ async fn handle_connect(
             upstream.mark_offline();
             upstream.record_failure();
             if tried.len() >= max_retries {
-                let _ = write_status(client, 502, "Bad Gateway").await;
-                bail!("all retries exhausted for CONNECT write");
+                write_status(client, 502, "Bad Gateway", metrics).await?;
+                return Ok(ProxyResponse::failure(502));
             }
             continue;
         }
@@ -259,33 +365,37 @@ async fn handle_connect(
         match read_connect_response(&mut up_stream).await {
             Ok(200) => {
                 // Success — tell client we're connected
-                client
-                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                    .await?;
+                let response = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+                client.write_all(response).await?;
+                metrics.add_bytes_sent(response.len() as u64);
                 upstream
                     .active_conns
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let t0 = Instant::now();
-                let result = tunnel(client, up_stream).await;
+                let result = tunnel(client, up_stream, metrics).await;
                 upstream
                     .active_conns
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 upstream.record_success(t0.elapsed().as_millis() as u64);
-                return result;
+                if let Err(e) = result {
+                    debug!(upstream = %upstream.config.url, error = %e, "CONNECT tunnel closed with error");
+                }
+                return Ok(ProxyResponse::success(200, false));
             }
             Ok(status) => {
                 // Upstream rejected CONNECT (e.g. auth required, forbidden)
                 debug!(upstream = %upstream.config.url, status, "CONNECT rejected by upstream");
-                let _ = write_status(client, status as u16, "Upstream rejected CONNECT").await;
-                bail!("upstream rejected CONNECT with status {status}");
+                let client_status = status as u16;
+                write_status(client, client_status, "Upstream rejected CONNECT", metrics).await?;
+                return Ok(ProxyResponse::failure(client_status));
             }
             Err(e) => {
                 warn!(upstream = %upstream.config.url, error = %e, "CONNECT: bad upstream response");
                 upstream.mark_offline();
                 upstream.record_failure();
                 if tried.len() >= max_retries {
-                    let _ = write_status(client, 502, "Bad Gateway").await;
-                    bail!("all retries exhausted reading CONNECT response");
+                    write_status(client, 502, "Bad Gateway", metrics).await?;
+                    return Ok(ProxyResponse::failure(502));
                 }
                 continue;
             }
@@ -294,13 +404,10 @@ async fn handle_connect(
 }
 
 /// Bidirectional copy between client and upstream until either side closes.
-async fn tunnel(client: &mut TcpStream, mut upstream: TcpStream) -> Result<()> {
-    let (mut cr, mut cw) = tokio::io::split(client);
-    let (mut ur, mut uw) = tokio::io::split(&mut upstream);
-    tokio::select! {
-        r = tokio::io::copy(&mut cr, &mut uw) => { r?; }
-        r = tokio::io::copy(&mut ur, &mut cw) => { r?; }
-    }
+async fn tunnel(client: &mut TcpStream, mut upstream: TcpStream, metrics: &Metrics) -> Result<()> {
+    let (from_client, to_client) = tokio::io::copy_bidirectional(client, &mut upstream).await?;
+    metrics.add_bytes_received(from_client);
+    metrics.add_bytes_sent(to_client);
     Ok(())
 }
 
@@ -322,14 +429,15 @@ async fn handle_http(
     mode: BalanceMode,
     use_proxy: bool,
     direct_target: (&str, u16),
-) -> Result<bool> {
+    metrics: &Metrics,
+) -> Result<ProxyResponse> {
     if !use_proxy {
         let addr = format!("{}:{}", direct_target.0, direct_target.1);
         let mut direct_stream = match connect_target(&addr).await {
             Ok(s) => s,
             Err(_) => {
-                let _ = write_status(client, 502, "Bad Gateway").await;
-                return Ok(false);
+                write_status(client, 502, "Bad Gateway", metrics).await?;
+                return Ok(ProxyResponse::failure(502));
             }
         };
         let no_proxy_auth = None;
@@ -348,18 +456,22 @@ async fn handle_http(
             req_content_length,
             req_is_chunked,
             already_in_buf as u64,
+            metrics,
         )
         .await
         .is_err()
         {
-            return Ok(false);
+            return Ok(ProxyResponse::failure(502));
         }
 
-        let upstream_keep_alive = match forward_response(&mut direct_stream, client, method).await {
-            Ok(v) => v,
-            Err(_) => return Ok(false),
+        let response = match forward_response(&mut direct_stream, client, method, metrics).await {
+            Ok(outcome) => outcome,
+            Err(_) => return Ok(ProxyResponse::failure(502)),
         };
-        return Ok(client_keep_alive && upstream_keep_alive);
+        return Ok(ProxyResponse::success(
+            response.response_status,
+            client_keep_alive && response.upstream_keep_alive,
+        ));
     }
 
     let mut tried: Vec<usize> = Vec::new();
@@ -369,8 +481,8 @@ async fn handle_http(
         let (idx, upstream) = match pool.select(mode, &tried) {
             Some(u) => u,
             None => {
-                let _ = write_status(client, 502, "No upstream available").await;
-                return Ok(false);
+                write_status(client, 502, "No upstream available", metrics).await?;
+                return Ok(ProxyResponse::failure(502));
             }
         };
         tried.push(idx);
@@ -386,8 +498,8 @@ async fn handle_http(
                 upstream.mark_offline();
                 upstream.record_failure();
                 if tried.len() >= max_retries {
-                    let _ = write_status(client, 502, "Bad Gateway").await;
-                    return Ok(false);
+                    write_status(client, 502, "Bad Gateway", metrics).await?;
+                    return Ok(ProxyResponse::failure(502));
                 }
                 continue;
             }
@@ -405,8 +517,8 @@ async fn handle_http(
             upstream.mark_offline();
             upstream.record_failure();
             if tried.len() >= max_retries {
-                let _ = write_status(client, 502, "Bad Gateway").await;
-                return Ok(false);
+                write_status(client, 502, "Bad Gateway", metrics).await?;
+                return Ok(ProxyResponse::failure(502));
             }
             continue;
         }
@@ -420,7 +532,8 @@ async fn handle_http(
                 upstream.mark_offline();
                 upstream.record_failure();
                 if tried.len() >= max_retries {
-                    return Ok(false);
+                    write_status(client, 502, "Bad Gateway", metrics).await?;
+                    return Ok(ProxyResponse::failure(502));
                 }
                 continue;
             }
@@ -431,11 +544,12 @@ async fn handle_http(
             req_content_length,
             req_is_chunked,
             already_in_buf as u64,
+            metrics,
         )
         .await
         {
             warn!(error = %e, "HTTP: body forward error");
-            return Ok(false);
+            return Ok(ProxyResponse::failure(502));
         }
 
         // --- Stream response back ---
@@ -443,22 +557,25 @@ async fn handle_http(
         upstream
             .active_conns
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let resp_result = forward_response(&mut up_stream, client, method).await;
+        let resp_result = forward_response(&mut up_stream, client, method, metrics).await;
         upstream
             .active_conns
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
         match resp_result {
-            Ok(upstream_keep_alive) => {
+            Ok(response) => {
                 upstream.record_success(t0.elapsed().as_millis() as u64);
-                return Ok(client_keep_alive && upstream_keep_alive);
+                return Ok(ProxyResponse::success(
+                    response.response_status,
+                    client_keep_alive && response.upstream_keep_alive,
+                ));
             }
             Err(e) => {
                 warn!(upstream = %upstream.config.url, error = %e, "HTTP: response forward failed");
                 upstream.mark_offline();
                 upstream.record_failure();
                 if tried.len() >= max_retries {
-                    return Ok(false);
+                    return Ok(ProxyResponse::failure(502));
                 }
                 continue;
             }
@@ -482,14 +599,17 @@ async fn forward_body(
     content_length: Option<u64>,
     is_chunked: bool,
     already_sent: u64,
+    metrics: &Metrics,
 ) -> Result<()> {
     if let Some(len) = content_length {
         let remaining = len.saturating_sub(already_sent);
         if remaining > 0 {
-            copy_exact(client, upstream, remaining).await?;
+            let copied = copy_exact(client, upstream, remaining).await?;
+            metrics.add_bytes_received(copied);
         }
     } else if is_chunked {
-        copy_chunked(client, upstream).await?;
+        let copied = copy_chunked(client, upstream).await?;
+        metrics.add_bytes_received(copied);
     }
     // else: no body (GET / HEAD / etc.)
     Ok(())
@@ -504,7 +624,8 @@ async fn forward_response(
     upstream: &mut TcpStream,
     client: &mut TcpStream,
     req_method: &str,
-) -> Result<bool> {
+    metrics: &Metrics,
+) -> Result<ResponseForwardOutcome> {
     // Read response headers
     let header_buf = read_headers(upstream)
         .await?
@@ -527,14 +648,17 @@ async fn forward_response(
         .map(|v| v.to_ascii_lowercase().contains("chunked"))
         .unwrap_or(false);
     let upstream_keep_alive = upstream_wants_keep_alive(headers, version);
+    let response_status = status;
 
     // Forward headers verbatim
     client.write_all(&header_buf[..body_offset]).await?;
+    metrics.add_bytes_sent(body_offset as u64);
 
     // Forward any body bytes that were buffered with the headers
     let already_in_buf = header_buf.len().saturating_sub(body_offset);
     if already_in_buf > 0 {
         client.write_all(&header_buf[body_offset..]).await?;
+        metrics.add_bytes_sent(already_in_buf as u64);
     }
 
     // Determine whether this response has a body
@@ -547,19 +671,28 @@ async fn forward_response(
         if let Some(len) = resp_content_length {
             let remaining = len.saturating_sub(already_in_buf as u64);
             if remaining > 0 {
-                copy_exact(upstream, client, remaining).await?;
+                let copied = copy_exact(upstream, client, remaining).await?;
+                metrics.add_bytes_sent(copied);
             }
         } else if resp_is_chunked {
-            copy_chunked(upstream, client).await?;
+            let copied = copy_chunked(upstream, client).await?;
+            metrics.add_bytes_sent(copied);
         } else {
             // No Content-Length and not chunked: read until upstream closes.
             // We must also close the client connection afterwards.
-            tokio::io::copy(upstream, client).await?;
-            return Ok(false);
+            let copied = tokio::io::copy(upstream, client).await?;
+            metrics.add_bytes_sent(copied);
+            return Ok(ResponseForwardOutcome {
+                response_status,
+                upstream_keep_alive: false,
+            });
         }
     }
 
-    Ok(upstream_keep_alive)
+    Ok(ResponseForwardOutcome {
+        response_status,
+        upstream_keep_alive,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -568,17 +701,19 @@ async fn forward_response(
 
 /// Read a raw chunked stream from `src` and write to `dst` until the
 /// terminal `0\r\n\r\n` chunk.
-async fn copy_chunked(src: &mut TcpStream, dst: &mut TcpStream) -> Result<()> {
+async fn copy_chunked(src: &mut TcpStream, dst: &mut TcpStream) -> Result<u64> {
     let mut buf = vec![0u8; 8 * 1024];
     // We look for the terminal chunk marker in what we forward.
     // Since this is a relay, we forward bytes verbatim and detect the end.
     let mut trailer = Vec::new();
+    let mut copied = 0;
     loop {
         let n = src.read(&mut buf).await?;
         if n == 0 {
             break;
         }
         dst.write_all(&buf[..n]).await?;
+        copied += n as u64;
         // Accumulate last 8 bytes to detect "0\r\n\r\n"
         trailer.extend_from_slice(&buf[..n]);
         if trailer.len() > 8 {
@@ -588,12 +723,13 @@ async fn copy_chunked(src: &mut TcpStream, dst: &mut TcpStream) -> Result<()> {
             break;
         }
     }
-    Ok(())
+    Ok(copied)
 }
 
 /// Copy exactly `bytes` bytes from `src` to `dst`.
-async fn copy_exact(src: &mut TcpStream, dst: &mut TcpStream, mut bytes: u64) -> Result<()> {
+async fn copy_exact(src: &mut TcpStream, dst: &mut TcpStream, mut bytes: u64) -> Result<u64> {
     let mut buf = vec![0u8; 8 * 1024];
+    let mut copied = 0;
     while bytes > 0 {
         let to_read = (buf.len() as u64).min(bytes) as usize;
         let n = src.read(&mut buf[..to_read]).await?;
@@ -601,9 +737,10 @@ async fn copy_exact(src: &mut TcpStream, dst: &mut TcpStream, mut bytes: u64) ->
             bail!("unexpected EOF: expected {bytes} more bytes");
         }
         dst.write_all(&buf[..n]).await?;
+        copied += n as u64;
         bytes -= n as u64;
     }
-    Ok(())
+    Ok(copied)
 }
 
 /// Read bytes from `stream` into a growing buffer until the HTTP header
@@ -908,10 +1045,59 @@ fn upstream_wants_keep_alive(headers: &[httparse::Header<'_>], version: u8) -> b
     }
 }
 
-async fn write_status(stream: &mut TcpStream, code: u16, msg: &str) -> Result<()> {
-    let resp = format!("HTTP/1.1 {code} {msg}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+pub async fn reject_connection(mut stream: TcpStream) -> Result<()> {
+    let resp = build_status_response(503, "Service Unavailable");
     stream.write_all(resp.as_bytes()).await?;
     Ok(())
+}
+
+async fn write_status(
+    stream: &mut TcpStream,
+    code: u16,
+    msg: &str,
+    metrics: &Metrics,
+) -> Result<()> {
+    let resp = build_status_response(code, msg);
+    metrics.add_bytes_sent(resp.len() as u64);
+    stream.write_all(resp.as_bytes()).await?;
+    Ok(())
+}
+
+fn build_status_response(code: u16, msg: &str) -> String {
+    format!("HTTP/1.1 {code} {msg}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+}
+
+fn request_log_context(buf: &[u8], domain_policy: &DomainPolicyConfig) -> RequestLogContext {
+    let mut ctx = RequestLogContext {
+        method: "UNKNOWN".to_string(),
+        target: "<unparsed>".to_string(),
+        direct: false,
+    };
+
+    let mut raw_headers = [httparse::EMPTY_HEADER; 96];
+    let mut req = httparse::Request::new(&mut raw_headers);
+    let parsed = matches!(req.parse(buf), Ok(httparse::Status::Complete(_)));
+    if !parsed {
+        return ctx;
+    }
+
+    if let Some(method) = req.method {
+        ctx.method = method.to_string();
+    }
+    if let Some(path) = req.path {
+        ctx.target = path.to_string();
+        ctx.direct = if ctx.method.eq_ignore_ascii_case("CONNECT") {
+            parse_connect_target(path)
+                .map(|(host, _)| !should_use_proxy(&host, domain_policy))
+                .unwrap_or(false)
+        } else {
+            parse_http_target(path, req.headers)
+                .map(|(host, _)| !should_use_proxy(&host, domain_policy))
+                .unwrap_or(false)
+        };
+    }
+
+    ctx
 }
 
 #[cfg(test)]

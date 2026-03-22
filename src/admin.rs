@@ -319,9 +319,7 @@ fn build_prometheus_metrics(pool: &Arc<UpstreamPool>, metrics: &Arc<Metrics>) ->
         metrics.health_checks_total.load(Ordering::Relaxed)
     ));
 
-    out.push_str(
-        "# HELP http_proxy_lb_health_checks_success Successful health check probes\n",
-    );
+    out.push_str("# HELP http_proxy_lb_health_checks_success Successful health check probes\n");
     out.push_str("# TYPE http_proxy_lb_health_checks_success counter\n");
     out.push_str(&format!(
         "http_proxy_lb_health_checks_success {}\n",
@@ -336,16 +334,24 @@ fn build_prometheus_metrics(pool: &Arc<UpstreamPool>, metrics: &Arc<Metrics>) ->
     ));
 
     // Per-upstream metrics
-    out.push_str("# HELP http_proxy_lb_upstream_online Whether upstream is online (1) or offline (0)\n");
+    out.push_str(
+        "# HELP http_proxy_lb_upstream_online Whether upstream is online (1) or offline (0)\n",
+    );
     out.push_str("# TYPE http_proxy_lb_upstream_online gauge\n");
 
-    out.push_str("# HELP http_proxy_lb_upstream_active_connections Active connections per upstream\n");
+    out.push_str(
+        "# HELP http_proxy_lb_upstream_active_connections Active connections per upstream\n",
+    );
     out.push_str("# TYPE http_proxy_lb_upstream_active_connections gauge\n");
 
-    out.push_str("# HELP http_proxy_lb_upstream_latency_ms Latency EMA in milliseconds per upstream\n");
+    out.push_str(
+        "# HELP http_proxy_lb_upstream_latency_ms Latency EMA in milliseconds per upstream\n",
+    );
     out.push_str("# TYPE http_proxy_lb_upstream_latency_ms gauge\n");
 
-    out.push_str("# HELP http_proxy_lb_upstream_consecutive_failures Consecutive failures per upstream\n");
+    out.push_str(
+        "# HELP http_proxy_lb_upstream_consecutive_failures Consecutive failures per upstream\n",
+    );
     out.push_str("# TYPE http_proxy_lb_upstream_consecutive_failures gauge\n");
 
     for status in pool.all_status() {

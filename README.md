@@ -70,6 +70,30 @@ Set `RUST_LOG=debug` for verbose logging.
 ./target/release/http-proxy-lb --config config.yaml --check
 ```
 
+## Validation
+
+```bash
+# unit + integration tests
+cargo test
+
+# lint
+cargo clippy -- -D warnings
+
+# formatting
+cargo fmt -- --check
+
+# container smoke test
+./scripts/docker-smoke.sh
+```
+
+The integration test suite exercises:
+
+* config validation failure paths
+* direct HTTP forwarding with real response-status propagation
+* request timeout handling (`504 Gateway Timeout`)
+* connection limiting (`503 Service Unavailable`)
+* admin metrics/status byte counters and request counters
+
 ## Configuration
 
 ```yaml
@@ -234,6 +258,12 @@ sudo systemctl enable --now http-proxy-lb
 
 ```bash
 docker compose --profile monitoring up -d
+```
+
+For a local container smoke test without touching your own config, run:
+
+```bash
+./scripts/docker-smoke.sh
 ```
 
 ## License
