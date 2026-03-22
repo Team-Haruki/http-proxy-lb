@@ -1,6 +1,6 @@
 [package]
 name = "http-proxy-lb"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "HTTP relay proxy with upstream load balancing, health checking, and hot reload"
 license = "MIT"
