@@ -1,0 +1,34 @@
+[Unit]
+Description=HTTP Proxy Load Balancer
+Documentation=https://github.com/Team-Haruki/http-proxy-lb
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=proxy
+Group=proxy
+ExecStart=/usr/local/bin/http-proxy-lb --config /etc/http-proxy-lb/config.yaml
+Restart=on-failure
+RestartSec=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=http-proxy-lb
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/etc/http-proxy-lb
+
+# Resource limits (adjust as needed)
+LimitNOFILE=65535
+
+# Environment
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

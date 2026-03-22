@@ -1,0 +1,72 @@
+# http-proxy-lb example configuration
+# Copy to config.yaml and edit as needed.
+
+# Local address and port to listen on
+listen: "127.0.0.1:8080"
+
+# Optional: Admin server address for /metrics (Prometheus) and /status (JSON) endpoints
+# admin_listen: "127.0.0.1:9090"
+
+# Load-balancing mode: round_robin | best | priority
+#   round_robin — weighted round-robin across all online upstreams
+#   best        — select the online upstream with the lowest combined score
+#                 (latency EMA + active-connection penalty)
+#   priority    — select the online upstream with the lowest priority value
+mode: round_robin
+
+# Hot-reload: re-read config file every N seconds (0 = disabled)
+reload_interval_secs: 60
+
+# Enable access logging (logs each request with method, target, status, latency)
+access_log: false
+
+# Active health-check settings
+health_check:
+  # How often to probe offline upstreams (seconds)
+  interval_secs: 30
+  # TCP-connect timeout when probing (seconds)
+  timeout_secs: 5
+
+# Resource limits (all optional, 0 = unlimited)
+limits:
+  # Maximum concurrent client connections (0 = unlimited)
+  max_connections: 0
+  # Request timeout in seconds (0 = unlimited)
+  request_timeout_secs: 0
+  # Graceful shutdown timeout in seconds
+  shutdown_timeout_secs: 30
+
+# Optional domain routing policy:
+#   off       — all domains use upstream proxy (default)
+#   blacklist — listed domains go direct (bypass upstream proxy)
+#   whitelist — listed domains use upstream proxy; others go direct
+domain_policy:
+  mode: off
+  # expression examples:
+  # - "domain:example.com"   # exact
+  # - "suffix:example.com"   # suffix
+  # - "*.example.com"        # suffix shorthand
+  # - ".example.com"         # suffix shorthand
+  # - "example.com"          # backward-compatible exact-or-suffix
+  domains: []
+
+# Upstream proxy pool
+# url      — http://host:port  (only HTTP proxies supported)
+# weight   — relative weight for round_robin (default: 1)
+# priority — priority for priority mode (lower = higher priority, default: 100)
+# username — optional HTTP proxy Basic-Auth username
+# password — optional HTTP proxy Basic-Auth password
+upstream:
+  - url: "http://proxy1.example.com:8080"
+    weight: 1
+    priority: 10
+
+  - url: "http://proxy2.example.com:8080"
+    weight: 2
+    priority: 20
+    username: "user"
+    password: "secret"
+
+  - url: "http://proxy3.example.com:3128"
+    weight: 1
+    priority: 30
