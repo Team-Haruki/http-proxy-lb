@@ -35,6 +35,29 @@ This repository contains `http-proxy-lb`, a Rust HTTP relay proxy with upstream 
 - `tests/integration_smoke.rs`: end-to-end integration tests for config validation, timeouts, metrics, and connection limits
 - `scripts/docker-smoke.sh`: local Docker smoke test helper
 
+## Git commit format
+
+All commits **must** follow:
+
+```
+[Type] Short description starting with capital letter
+```
+
+| Type      | Usage                                                 |
+|-----------|-------------------------------------------------------|
+| `[Feat]`  | New feature or capability                             |
+| `[Fix]`   | Bug fix                                               |
+| `[Chore]` | Maintenance, refactoring, dependency or build changes |
+| `[Docs]`  | Documentation-only changes                            |
+
+Rules:
+
+- Description starts with a **capital letter**.
+- Imperative mood (`Add ...`, not `Added ...`).
+- No trailing period.
+- Keep subject ≤ ~70 chars.
+- Agent commits must include a `Co-Authored-By` trailer to attribute the agent.
+
 ## Expectations
 
 - Keep changes minimal and targeted.
