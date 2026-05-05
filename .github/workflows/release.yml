@@ -72,7 +72,7 @@ jobs:
           Compress-Archive -Path "$pkgDir/*" -DestinationPath "$pkgDir.zip"
 
       - name: Upload packaged artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
           path: |
