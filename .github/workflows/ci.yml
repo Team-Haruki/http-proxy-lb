@@ -63,14 +63,14 @@ jobs:
 
       - name: Upload binary artifact (Unix)
         if: runner.os != 'Windows'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: http-proxy-lb-${{ runner.os }}
           path: target/release/http-proxy-lb
 
       - name: Upload binary artifact (Windows)
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: http-proxy-lb-${{ runner.os }}
           path: target/release/http-proxy-lb.exe
